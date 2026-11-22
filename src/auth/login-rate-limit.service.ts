@@ -1,0 +1,257 @@
+import { Injectable, Logger } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import { PrismaService } from '../database/prisma.service';
+import { redactEmail } from './security.utils';
+
+export interface LoginAttemptConfig {
+  maxAttempts: number;
+  lockoutDurationMinutes: number;
+}
+
+const DEFAULT_MAX_ATTEMPTS = 5;
+const DEFAULT_LOCKOUT_DURATION_MINUTES = 30;
+
+@Injectable()
+export class LoginRateLimitService {
+  private readonly logger = new Logger(LoginRateLimitService.name);
+  private readonly config: LoginAttemptConfig;
+
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly configService: ConfigService,
+  ) {
+    this.config = {
+      maxAttempts: this.readPositiveInt('LOGIN_MAX_ATTEMPTS', DEFAULT_MAX_ATTEMPTS),
+      lockoutDurationMinutes: this.readPositiveInt(
+        'LOGIN_LOCKOUT_MINUTES',
+        DEFAULT_LOCKOUT_DURATION_MINUTES,
+      ),
+    };
+  }
+
+  /**
+   * Read a positive integer from configuration, falling back to a safe default
+   * (with a warning) when the value is missing or invalid (#1190).
+   */
+  private readPositiveInt(key: string, fallback: number): number {
+    const raw = this.configService.get<string>(key);
+    if (raw === undefined || raw.trim() === '') {
+      return fallback;
+    }
+    const value = Number(raw);
+    if (!Number.isInteger(value) || value <= 0) {
+      this.logger.warn(`Invalid value "${raw}" for ${key}; falling back to ${fallback}.`);
+      return fallback;
+    }
+    return value;
+  }
+
+  /**
+   * Check if an account is currently locked out
+   */
+  async isAccountLocked(email: string): Promise<boolean> {
+    const lockedAttempt = await this.prisma.loginAttempt.findFirst({
+      where: {
+        email: email.toLowerCase(),
+        lockedOut: true,
+        unlockAt: {
+          gt: new Date(),
+        },
+      },
+      orderBy: {
+        attemptTime: 'desc',
+      },
+    });
+
+    return lockedAttempt !== null;
+  }
+
+  /**
+   * Record a failed login attempt
+   * Returns true if account should be locked
+   */
+  async recordFailedAttempt(
+    email: string,
+    ipAddress?: string,
+    userAgent?: string,
+  ): Promise<boolean> {
+    const normalizedEmail = email.toLowerCase();
+
+    // Count recent failed attempts within lockout window
+    const lockoutWindowStart = new Date(
+      Date.now() - this.config.lockoutDurationMinutes * 60 * 1000,
+    );
+
+    const recentFailures = await this.prisma.loginAttempt.count({
+      where: {
+        email: normalizedEmail,
+        success: false,
+        attemptTime: {
+          gte: lockoutWindowStart,
+        },
+      },
+    });
+
+    const shouldLock = recentFailures + 1 >= this.config.maxAttempts;
+    const unlockAt = shouldLock
+      ? new Date(Date.now() + this.config.lockoutDurationMinutes * 60 * 1000)
+      : null;
+
+    // Record this attempt
+    await this.prisma.loginAttempt.create({
+      data: {
+        email: normalizedEmail,
+        ipAddress,
+        userAgent,
+        success: false,
+        lockedOut: shouldLock,
+        unlockAt,
+      },
+    });
+
+    if (shouldLock) {
+      this.logger.warn(
+        `Account locked due to too many failed login attempts: ${redactEmail(email)} (IP: ${ipAddress || 'unknown'})`,
+      );
+    }
+
+    return shouldLock;
+  }
+
+  /**
+   * Record a successful login attempt
+   */
+  async recordSuccessfulAttempt(
+    email: string,
+    ipAddress?: string,
+    userAgent?: string,
+  ): Promise<void> {
+    await this.prisma.loginAttempt.create({
+      data: {
+        email: email.toLowerCase(),
+        ipAddress,
+        userAgent,
+        success: true,
+        lockedOut: false,
+      },
+    });
+
+    this.logger.log(`Successful login: ${redactEmail(email)} (IP: ${ipAddress || 'unknown'})`);
+  }
+
+  /**
+   * Get the number of failed attempts in the current window
+   */
+  async getFailedAttemptsCount(email: string): Promise<number> {
+    const lockoutWindowStart = new Date(
+      Date.now() - this.config.lockoutDurationMinutes * 60 * 1000,
+    );
+
+    return this.prisma.loginAttempt.count({
+      where: {
+        email: email.toLowerCase(),
+        success: false,
+        attemptTime: {
+          gte: lockoutWindowStart,
+        },
+      },
+    });
+  }
+
+  /**
+   * Manually unlock an account (for admin or user request)
+   */
+  async unlockAccount(email: string): Promise<void> {
+    const normalizedEmail = email.toLowerCase();
+
+    // Mark all locked attempts as unlocked
+    await this.prisma.loginAttempt.updateMany({
+      where: {
+        email: normalizedEmail,
+        lockedOut: true,
+        unlockAt: {
+          gt: new Date(),
+        },
+      },
+      data: {
+        lockedOut: false,
+        unlockAt: null,
+      },
+    });
+
+    this.logger.log(`Account manually unlocked: ${redactEmail(email)}`);
+  }
+
+  /**
+   * Get lockout information for an account
+   */
+  async getLockoutInfo(email: string): Promise<{
+    isLocked: boolean;
+    failedAttempts: number;
+    unlockAt?: Date;
+    remainingLockoutMinutes?: number;
+  } | null> {
+    const normalizedEmail = email.toLowerCase();
+
+    const failedAttempts = await this.getFailedAttemptsCount(normalizedEmail);
+    const isLocked = await this.isAccountLocked(normalizedEmail);
+
+    if (!isLocked && failedAttempts === 0) {
+      return null;
+    }
+
+    let unlockAt: Date | undefined;
+    let remainingLockoutMinutes: number | undefined;
+
+    if (isLocked) {
+      const lockedAttempt = await this.prisma.loginAttempt.findFirst({
+        where: {
+          email: normalizedEmail,
+          lockedOut: true,
+          unlockAt: {
+            gt: new Date(),
+          },
+        },
+        orderBy: {
+          attemptTime: 'desc',
+        },
+        select: {
+          unlockAt: true,
+        },
+      });
+
+      if (lockedAttempt?.unlockAt) {
+        unlockAt = lockedAttempt.unlockAt;
+        if (unlockAt) {
+          remainingLockoutMinutes = Math.ceil((unlockAt.getTime() - Date.now()) / (1000 * 60));
+        }
+      }
+    }
+
+    return {
+      isLocked,
+      failedAttempts,
+      unlockAt,
+      remainingLockoutMinutes,
+    };
+  }
+
+  /**
+   * Clean up old login attempts (for maintenance)
+   */
+  async cleanupOldAttempts(olderThanDays: number = 30): Promise<number> {
+    const cutoffDate = new Date();
+    cutoffDate.setDate(cutoffDate.getDate() - olderThanDays);
+
+    const result = await this.prisma.loginAttempt.deleteMany({
+      where: {
+        attemptTime: {
+          lt: cutoffDate,
+        },
+      },
+    });
+
+    this.logger.log(`Cleaned up ${result.count} old login attempts`);
+    return result.count;
+  }
+}

@@ -1,100 +1,67 @@
-import { ExceptionFilter, Catch, ArgumentsHost, HttpException, HttpStatus, Logger } from '@nestjs/common';
+import { ExceptionFilter, Catch, ArgumentsHost, HttpStatus, Logger } from '@nestjs/common';
 import { Request, Response } from 'express';
-import { ConfigService } from '@nestjs/config';
-import { LoggerService } from '../logger/logger.service';
+import { I18nService, SupportedLanguage } from '../../i18n/i18n.service';
+import { buildErrorResponse, extractTraceId } from '../contracts/error-response';
+
+interface AuthenticatedUserShape {
+  languagePreference?: string | null;
+}
 
 @Catch()
 export class AllExceptionsFilter implements ExceptionFilter {
   private readonly logger = new Logger(AllExceptionsFilter.name);
 
-  constructor(
-    private readonly configService: ConfigService,
-    private readonly loggerService: LoggerService,
-  ) {}
+  constructor(private readonly i18n: I18nService) {}
 
   catch(exception: unknown, host: ArgumentsHost): void {
     const ctx = host.switchToHttp();
     const response = ctx.getResponse<Response>();
-    const request = ctx.getRequest<Request>();
+    const request = ctx.getRequest<Request & { user?: AuthenticatedUserShape }>();
 
-    let status: number;
-    let message: string;
-    let error: string;
+    const language = this.resolveLanguage(request);
+    const fallback = this.i18n.tFor('common.unexpected_error', language);
+    const message =
+      exception instanceof Error
+        ? exception.message || fallback
+        : this.i18n.tFor('common.internal_server_error', language);
 
-    if (exception instanceof HttpException) {
-      status = exception.getStatus();
-      const exceptionResponse = exception.getResponse();
+    const safeMessage =
+      process.env.NODE_ENV === 'production' && !(exception instanceof Error) ? fallback : message;
 
-      if (typeof exceptionResponse === 'string') {
-        message = exceptionResponse;
-        error = exception.constructor.name;
-      } else if (typeof exceptionResponse === 'object') {
-        message = (exceptionResponse as any).message || exception.message;
-        error = (exceptionResponse as any).error || exception.constructor.name;
-      } else {
-        message = exception.message;
-        error = exception.constructor.name;
-      }
-    } else {
-      status = HttpStatus.INTERNAL_SERVER_ERROR;
-      message = 'Internal server error';
-      error = 'InternalServerError';
-    }
+    this.logger.error(
+      `Uncaught Exception: ${safeMessage} - ${request.url}`,
+      exception instanceof Error ? exception.stack : 'No stack trace available',
+    );
 
-    // Log the error
-    this.logError(exception, request, status);
-
-    // Prepare error response
-    const errorResponse = {
-      statusCode: status,
-      timestamp: new Date().toISOString(),
-      path: request.url,
-      method: request.method,
-      message,
-      error,
-      ...(this.configService.get('NODE_ENV') === 'development' && {
-        stack: exception instanceof Error ? exception.stack : undefined,
+    response.status(HttpStatus.INTERNAL_SERVER_ERROR).json(
+      buildErrorResponse({
+        statusCode: HttpStatus.INTERNAL_SERVER_ERROR,
+        message: safeMessage,
+        traceId: extractTraceId(request),
+        path: request.url,
+        language,
+        legacy: {
+          stack:
+            process.env.NODE_ENV === 'development' && exception instanceof Error
+              ? exception.stack
+              : undefined,
+        },
       }),
-    };
-
-    response.status(status).json(errorResponse);
+    );
   }
 
-  private logError(exception: unknown, request: Request, status: number): void {
-    const userId = (request as any).user?.id;
-    const ip = request.ip || request.connection.remoteAddress;
-
-    if (exception instanceof HttpException) {
-      // Log HTTP exceptions as warnings
-      this.loggerService.warn(`HTTP Exception: ${exception.message}`, AllExceptionsFilter.name);
-
-      this.loggerService.logSecurityEvent(
-        'http_exception',
-        {
-          message: exception.message,
-          status,
-          url: request.url,
-          method: request.method,
-        },
-        userId,
-        ip,
-      );
-    } else {
-      // Log unexpected errors as errors
-      const error = exception instanceof Error ? exception : new Error(String(exception));
-      this.loggerService.logError(error, AllExceptionsFilter.name, userId);
-
-      this.loggerService.logSecurityEvent(
-        'unhandled_exception',
-        {
-          message: error.message,
-          stack: error.stack,
-          url: request.url,
-          method: request.method,
-        },
-        userId,
-        ip,
-      );
-    }
+  private resolveLanguage(request: Request & { user?: AuthenticatedUserShape }): SupportedLanguage {
+    const explicitOverride =
+      typeof request.headers['x-language'] === 'string'
+        ? (request.headers['x-language'] as string)
+        : undefined;
+    const fromHeader =
+      typeof request.headers['accept-language'] === 'string'
+        ? (request.headers['accept-language'] as string)
+        : undefined;
+    return this.i18n.resolveLanguage({
+      userPreference: request.user?.languagePreference ?? explicitOverride ?? null,
+      acceptLanguageHeader: fromHeader,
+    });
   }
 }

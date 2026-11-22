@@ -1,0 +1,519 @@
+import { Injectable, Logger, NotFoundException } from '@nestjs/common';
+import { PrismaService } from '../database/prisma.service';
+import { BackupService } from '../backup/backup.service';
+import { UpdateBackupScheduleDto } from '../backup/dto/backup.dto';
+import {
+  AddFraudInvestigationNoteDto,
+  AdminUpdateUserDto,
+  AdminUsersQueryDto,
+  BlockFraudUserDto,
+  BulkModerationAction,
+  BulkModerationDto,
+  FraudAlertsQueryDto,
+  ModerationQueueQueryDto,
+  ReviewFraudAlertDto,
+  TransactionMonitoringQueryDto,
+  UpdateTransactionStatusDto,
+} from './dto/admin.dto';
+import { PropertyStatus, TransactionStatus, TransactionType } from '../types/prisma.types';
+import { FraudService } from '../fraud/fraud.service';
+import { SessionsService } from '../sessions/sessions.service';
+import { TransactionsService } from '../transactions/transactions.service';
+
+const logger = new Logger('AdminService');
+
+@Injectable()
+export class AdminService {
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly fraudService: FraudService,
+    private readonly backupService: BackupService,
+    private readonly transactionsService: TransactionsService,
+    private readonly sessionsService: SessionsService,
+  ) {}
+
+  async listBackups() {
+    return this.backupService.listBackups();
+  }
+
+  async getBackupStatus() {
+    return this.backupService.getBackupStatus();
+  }
+
+  async getBackupSchedule() {
+    return this.backupService.getSchedule();
+  }
+
+  async updateBackupSchedule(payload: UpdateBackupScheduleDto) {
+    return this.backupService.updateSchedule(payload);
+  }
+
+  async runBackup(actorId: string) {
+    return this.backupService.createManualBackup(actorId);
+  }
+
+  async restoreBackup(backupId: string, actorId: string) {
+    return this.backupService.restoreBackup(backupId, actorId);
+  }
+
+  async getBackupDownload(backupId: string) {
+    return this.backupService.getBackupFile(backupId);
+  }
+
+  async getDashboard() {
+    const [totalUsers, blockedUsers, totalProperties, pendingProperties, activeProperties] =
+      await Promise.all([
+        this.prisma.user.count(),
+        this.prisma.user.count({ where: { isBlocked: true } }),
+        this.prisma.property.count(),
+        this.prisma.property.count({ where: { status: PropertyStatus.PENDING } }),
+        this.prisma.property.count({ where: { status: PropertyStatus.ACTIVE } }),
+      ]);
+
+    const [completedTransactions, pendingTransactions, salesAggregate, rentAggregate] =
+      await Promise.all([
+        this.prisma.transaction.count({ where: { status: TransactionStatus.COMPLETED } }),
+        this.prisma.transaction.count({ where: { status: TransactionStatus.PENDING } }),
+        this.prisma.transaction.aggregate({
+          where: { status: TransactionStatus.COMPLETED, type: TransactionType.SALE },
+          _sum: { amount: true },
+        }),
+        this.prisma.transaction.aggregate({
+          where: { status: TransactionStatus.COMPLETED, type: TransactionType.TRANSFER },
+          _sum: { amount: true },
+        }),
+      ]);
+
+    return {
+      userStats: {
+        totalUsers,
+        blockedUsers,
+        activeUsers: totalUsers - blockedUsers,
+      },
+      propertyStats: {
+        totalProperties,
+        pendingProperties,
+        activeProperties,
+      },
+      revenueMetrics: {
+        totalSalesRevenue: salesAggregate._sum.amount ?? 0,
+        totalTransferRevenue: rentAggregate._sum.amount ?? 0,
+      },
+      systemHealth: {
+        completedTransactions,
+        pendingTransactions,
+      },
+    };
+  }
+
+  async listUsers(query: AdminUsersQueryDto) {
+    const page = query.page ?? 1;
+    const limit = query.limit ?? 20;
+    const skip = query.cursor ? undefined : (page - 1) * limit;
+
+    const where: any = {
+      role: query.role,
+      OR: query.search
+        ? [
+            { email: { contains: query.search, mode: 'insensitive' as const } },
+            { firstName: { contains: query.search, mode: 'insensitive' as const } },
+            { lastName: { contains: query.search, mode: 'insensitive' as const } },
+          ]
+        : undefined,
+    };
+
+    if (query.cursor) {
+      where.createdAt = { lt: new Date(Buffer.from(query.cursor, 'base64').toString()) };
+    }
+
+    const [items, total] = await Promise.all([
+      this.prisma.user.findMany({
+        where,
+        ...(skip !== undefined ? { skip } : {}),
+        take: limit,
+        orderBy: { createdAt: 'desc' },
+        select: {
+          id: true,
+          email: true,
+          firstName: true,
+          lastName: true,
+          role: true,
+          isVerified: true,
+          isBlocked: true,
+          createdAt: true,
+        },
+      }),
+      this.prisma.user.count({ where }),
+    ]);
+
+    const nextCursor =
+      items.length === limit
+        ? Buffer.from(items[items.length - 1].createdAt.toISOString()).toString('base64')
+        : null;
+
+    return { total, page, limit, items, nextCursor, previousCursor: query.cursor || null };
+  }
+
+  async updateUser(userId: string, payload: AdminUpdateUserDto, actorId?: string) {
+    const existingUser = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: { role: true, email: true },
+    });
+
+    if (!existingUser) {
+      throw new NotFoundException('User not found');
+    }
+
+    const updatedUser = await this.prisma.user.update({
+      where: { id: userId },
+      data: payload,
+      select: {
+        id: true,
+        email: true,
+        firstName: true,
+        lastName: true,
+        phone: true,
+        role: true,
+        isVerified: true,
+        isBlocked: true,
+        updatedAt: true,
+      },
+    });
+
+    // Audit log for role changes (#886)
+    if (payload.role && payload.role !== existingUser.role) {
+      await this.prisma.activityLog
+        .create({
+          data: {
+            userId: actorId ?? 'system',
+            action: 'ROLE_CHANGE',
+            entityType: 'USER',
+            entityId: userId,
+            description: `Role changed from ${existingUser.role} to ${payload.role} for user ${existingUser.email}`,
+            metadata: {
+              previousRole: existingUser.role,
+              newRole: payload.role,
+              targetUserId: userId,
+            },
+          },
+        })
+        .catch((err: unknown) => {
+          logger.error(`Failed to audit-log role change for ${userId}: ${err}`);
+        });
+
+      await this.sessionsService.revokeAllSessions(userId);
+    }
+
+    // Audit log for block state changes
+    if (payload.isBlocked !== undefined) {
+      await this.prisma.activityLog
+        .create({
+          data: {
+            userId: actorId ?? 'system',
+            action: payload.isBlocked ? 'USER_BLOCKED' : 'USER_UNBLOCKED',
+            entityType: 'USER',
+            entityId: userId,
+            description: `User ${existingUser.email} ${payload.isBlocked ? 'blocked' : 'unblocked'}`,
+            metadata: { targetUserId: userId, isBlocked: payload.isBlocked },
+          },
+        })
+        .catch((err: unknown) => {
+          logger.error(`Failed to audit-log block state for ${userId}: ${err}`);
+        });
+    }
+
+    return updatedUser;
+  }
+
+  async setUserBlockedState(userId: string, blocked: boolean) {
+    return this.prisma.user.update({
+      where: { id: userId },
+      data: { isBlocked: blocked },
+      select: {
+        id: true,
+        email: true,
+        isBlocked: true,
+      },
+    });
+  }
+
+  async getModerationQueue(query: ModerationQueueQueryDto) {
+    const page = query.page ?? 1;
+    const limit = query.limit ?? 20;
+    const skip = query.cursor ? undefined : (page - 1) * limit;
+
+    const where: any = {
+      status: query.status ?? PropertyStatus.PENDING,
+    };
+
+    if (query.cursor) {
+      where.createdAt = { lt: new Date(Buffer.from(query.cursor, 'base64').toString()) };
+    }
+
+    const [items, total] = await Promise.all([
+      this.prisma.property.findMany({
+        where,
+        ...(skip !== undefined ? { skip } : {}),
+        take: limit,
+        orderBy: { createdAt: 'asc' },
+        include: {
+          owner: {
+            select: {
+              id: true,
+              email: true,
+              firstName: true,
+              lastName: true,
+            },
+          },
+        },
+      }),
+      this.prisma.property.count({ where }),
+    ]);
+
+    const nextCursor =
+      items.length === limit
+        ? Buffer.from(items[items.length - 1].createdAt.toISOString()).toString('base64')
+        : null;
+
+    return { total, page, limit, items, nextCursor, previousCursor: query.cursor || null };
+  }
+
+  async approveProperty(propertyId: string) {
+    return this.prisma.property.update({
+      where: { id: propertyId },
+      data: { status: PropertyStatus.ACTIVE },
+    });
+  }
+
+  async rejectProperty(propertyId: string) {
+    return this.prisma.property.update({
+      where: { id: propertyId },
+      data: { status: PropertyStatus.ARCHIVED },
+    });
+  }
+
+  async flagProperty(propertyId: string, reason?: string) {
+    const property = await this.prisma.property.update({
+      where: { id: propertyId },
+      data: { status: PropertyStatus.ARCHIVED },
+    });
+
+    await this.prisma.activityLog.create({
+      data: {
+        userId: property.ownerId,
+        action: 'PROPERTY_FLAGGED_BY_ADMIN',
+        entityType: 'PROPERTY',
+        entityId: property.id,
+        description: reason ?? 'Property flagged by admin for moderation review.',
+      },
+    });
+
+    return property;
+  }
+
+  async bulkModerate(payload: BulkModerationDto) {
+    const status =
+      payload.action === BulkModerationAction.APPROVE
+        ? PropertyStatus.ACTIVE
+        : PropertyStatus.ARCHIVED;
+
+    const result = await this.prisma.property.updateMany({
+      where: { id: { in: payload.propertyIds } },
+      data: { status },
+    });
+
+    if (payload.action === BulkModerationAction.FLAG) {
+      const properties = await this.prisma.property.findMany({
+        where: { id: { in: payload.propertyIds } },
+        select: { id: true, ownerId: true },
+      });
+
+      await this.prisma.activityLog.createMany({
+        data: properties.map((property: { id: string; ownerId: string }) => ({
+          userId: property.ownerId,
+          action: 'PROPERTY_FLAGGED_BY_ADMIN',
+          entityType: 'PROPERTY',
+          entityId: property.id,
+          description: payload.reason ?? 'Property flagged by admin via bulk moderation.',
+        })),
+      });
+    }
+
+    return {
+      updatedCount: result.count,
+      action: payload.action,
+    };
+  }
+
+  async monitorTransactions(query: TransactionMonitoringQueryDto) {
+    const page = query.page ?? 1;
+    const limit = query.limit ?? 20;
+    const skip = query.cursor ? undefined : (page - 1) * limit;
+
+    const where: any = {
+      status: query.status,
+      type: query.type,
+      propertyId: query.propertyId,
+    };
+
+    if (query.cursor) {
+      where.createdAt = { lt: new Date(Buffer.from(query.cursor, 'base64').toString()) };
+    }
+
+    const [items, total] = await Promise.all([
+      this.prisma.transaction.findMany({
+        where,
+        ...(skip !== undefined ? { skip } : {}),
+        take: limit,
+        orderBy: { createdAt: 'desc' },
+        include: {
+          property: {
+            select: { id: true, title: true, address: true },
+          },
+          buyer: {
+            select: { id: true, email: true, firstName: true, lastName: true },
+          },
+          seller: {
+            select: { id: true, email: true, firstName: true, lastName: true },
+          },
+        },
+      }),
+      this.prisma.transaction.count({ where }),
+    ]);
+
+    const nextCursor =
+      items.length === limit
+        ? Buffer.from(items[items.length - 1].createdAt.toISOString()).toString('base64')
+        : null;
+
+    return { total, page, limit, items, nextCursor, previousCursor: query.cursor || null };
+  }
+
+  async transactionMonitoringSummary() {
+    const [pending, completed, cancelled, aggregateValue] = await Promise.all([
+      this.prisma.transaction.count({ where: { status: TransactionStatus.PENDING } }),
+      this.prisma.transaction.count({ where: { status: TransactionStatus.COMPLETED } }),
+      this.prisma.transaction.count({ where: { status: TransactionStatus.CANCELLED } }),
+      this.prisma.transaction.aggregate({
+        where: { status: TransactionStatus.COMPLETED },
+        _sum: { amount: true },
+      }),
+    ]);
+
+    return {
+      pending,
+      completed,
+      cancelled,
+      totalCompletedValue: aggregateValue._sum.amount ?? 0,
+    };
+  }
+
+  async updateTransactionStatus(
+    transactionId: string,
+    payload: UpdateTransactionStatusDto,
+    actorId?: string,
+  ) {
+    return this.transactionsService.updateTransactionStatus(transactionId, payload.status, actorId);
+  }
+
+  async listFraudAlerts(query: FraudAlertsQueryDto) {
+    return this.fraudService.listAlerts(query);
+  }
+
+  async getFraudAlertsSummary() {
+    return this.fraudService.getAlertSummary();
+  }
+
+  async getFraudAlertDetails(alertId: string) {
+    return this.fraudService.getAlertDetails(alertId);
+  }
+
+  async reviewFraudAlert(alertId: string, payload: ReviewFraudAlertDto, actorId: string) {
+    return this.fraudService.reviewAlert(alertId, payload, actorId);
+  }
+
+  async addFraudAlertNote(alertId: string, payload: AddFraudInvestigationNoteDto, actorId: string) {
+    return this.fraudService.addInvestigationNote(alertId, payload, actorId);
+  }
+
+  async blockFraudUser(alertId: string, actorId: string, payload?: BlockFraudUserDto) {
+    return this.fraudService.blockUserFromAlert(alertId, actorId, payload);
+  }
+
+  async scanUserForFraud(userId: string, actorId: string) {
+    return this.fraudService.runUserScan(userId, actorId);
+  }
+
+  async scanPropertyForFraud(propertyId: string, actorId: string) {
+    return this.fraudService.runPropertyScan(propertyId, actorId);
+  }
+
+  async listApiKeys() {
+    const keys = await this.prisma.apiKey.findMany({
+      orderBy: { createdAt: 'desc' },
+      include: {
+        user: { select: { id: true, email: true, firstName: true, lastName: true } },
+      },
+    });
+    return keys.map((key) => ({
+      id: key.id,
+      userId: key.userId,
+      user: key.user,
+      name: key.name,
+      keyPrefix: key.keyPrefix,
+      permissions: key.permissions,
+      usageCount: key.usageCount,
+      monthlyQuota: key.monthlyQuota,
+      lastUsedAt: key.lastUsedAt,
+      expiresAt: key.expiresAt,
+      revokedAt: key.revokedAt,
+      isRevoked: !!key.revokedAt,
+      createdAt: key.createdAt,
+    }));
+  }
+
+  async revokeApiKey(id: string) {
+    const key = await this.prisma.apiKey.findUnique({ where: { id } });
+    if (!key) throw new NotFoundException(`API key with ID ${id} not found`);
+    return this.prisma.apiKey.update({
+      where: { id },
+      data: { revokedAt: new Date() },
+    });
+  }
+
+  async rotateApiKey(id: string) {
+    const oldKey = await this.prisma.apiKey.findUnique({ where: { id } });
+    if (!oldKey) throw new NotFoundException(`API key with ID ${id} not found`);
+
+    const { randomBytes, createHash } = await import('crypto');
+    const newRawKey = `pk_${randomBytes(24).toString('hex')}`;
+    const newPrefix = newRawKey.slice(0, 8);
+    const newHash = createHash('sha256').update(newRawKey).digest('hex');
+
+    await this.prisma.apiKey.update({
+      where: { id },
+      data: { revokedAt: new Date() },
+    });
+
+    const newApiKey = await this.prisma.apiKey.create({
+      data: {
+        userId: oldKey.userId,
+        name: `${oldKey.name} (Rotated)`,
+        keyPrefix: newPrefix,
+        keyHash: newHash,
+        permissions: oldKey.permissions,
+        monthlyQuota: oldKey.monthlyQuota,
+        expiresAt: oldKey.expiresAt,
+      },
+    });
+
+    return {
+      revokedKeyId: id,
+      newApiKeyId: newApiKey.id,
+      rawApiKey: newRawKey,
+      keyPrefix: newPrefix,
+      name: newApiKey.name,
+      createdAt: newApiKey.createdAt,
+    };
+  }
+}

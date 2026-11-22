@@ -1,13 +1,14 @@
 import { Module } from '@nestjs/common';
+import { ConfigModule } from '@nestjs/config';
+import { ScheduleModule } from '@nestjs/schedule';
 import { BlockchainService } from './blockchain.service';
-import { StellarPayoutModule } from './stellar/stellar-payout.module';
-import { ExternalLedgerEventService } from './services/external-ledger-event.service';
-import { ExternalLedgerEventController } from './controllers/external-ledger-event.controller';
+import { BlockchainController } from './blockchain.controller';
+import { PrismaModule } from '../database/prisma.module';
 
 @Module({
-  imports: [StellarPayoutModule],
-  providers: [BlockchainService, ExternalLedgerEventService],
-  controllers: [ExternalLedgerEventController],
-  exports: [BlockchainService, StellarPayoutModule, ExternalLedgerEventService],
+  imports: [ConfigModule, PrismaModule, ScheduleModule.forRoot()],
+  providers: [BlockchainService],
+  controllers: [BlockchainController],
+  exports: [BlockchainService],
 })
-export class BlockchainModule { }
+export class BlockchainModule {}

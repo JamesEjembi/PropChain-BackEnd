@@ -1,0 +1,175 @@
+import { Injectable, Logger } from '@nestjs/common';
+import { cacheHitRatio, cacheHitsTotal, cacheMissesTotal } from '../metrics/metrics.controller';
+
+/**
+ * Cache Monitoring Service
+ * Monitors cache performance, hits/misses, errors, and health.
+ */
+
+export interface CacheMetrics {
+  hits: number;
+  misses: number;
+  errors: number;
+  hitRate: number;
+  totalRequests: number;
+  avgResponseTime: number;
+  timestamp: Date;
+}
+
+export interface CacheHealthStatus {
+  isConnected: boolean;
+  memoryUsage: number;
+  keysCount: number;
+  uptime: number;
+  commandsProcessed: number;
+}
+
+interface CacheMetricState {
+  hits: number;
+  misses: number;
+  errors: number;
+  totalRequests: number;
+  responseTimes: number[];
+}
+
+@Injectable()
+export class CacheMonitoringService {
+  private readonly logger = new Logger(CacheMonitoringService.name);
+
+  private metrics: CacheMetricState = {
+    hits: 0,
+    misses: 0,
+    errors: 0,
+    totalRequests: 0,
+    responseTimes: [],
+  };
+
+  /**
+   * Record cache hit.
+   */
+  recordHit(): void {
+    this.metrics.hits += 1;
+    this.metrics.totalRequests += 1;
+    cacheHitsTotal.inc();
+    this.updateCacheHitRatio();
+  }
+
+  /**
+   * Record cache miss.
+   */
+  recordMiss(): void {
+    this.metrics.misses += 1;
+    this.metrics.totalRequests += 1;
+    cacheMissesTotal.inc();
+    this.updateCacheHitRatio();
+  }
+
+  /**
+   * Record cache error.
+   */
+  recordError(): void {
+    this.metrics.errors += 1;
+    this.metrics.totalRequests += 1;
+  }
+
+  /**
+   * Update the Prometheus cache hit ratio gauge based on current metrics.
+   */
+  private updateCacheHitRatio(): void {
+    const total = this.metrics.hits + this.metrics.misses;
+    if (total > 0) {
+      const ratio = this.metrics.hits / total;
+      cacheHitRatio.set(ratio);
+    }
+  }
+
+  /**
+   * Record response time.
+   */
+  recordResponseTime(timeMs: number): void {
+    this.metrics.responseTimes.push(timeMs);
+
+    // Keep only the last 1000 measurements.
+    if (this.metrics.responseTimes.length > 1000) {
+      this.metrics.responseTimes.shift();
+    }
+  }
+
+  /**
+   * Get current cache metrics.
+   */
+  getMetrics(): CacheMetrics {
+    const hitRate =
+      this.metrics.totalRequests > 0 ? (this.metrics.hits / this.metrics.totalRequests) * 100 : 0;
+
+    const avgResponseTime =
+      this.metrics.responseTimes.length > 0
+        ? this.metrics.responseTimes.reduce((total, responseTime) => total + responseTime, 0) /
+          this.metrics.responseTimes.length
+        : 0;
+
+    return {
+      hits: this.metrics.hits,
+      misses: this.metrics.misses,
+      errors: this.metrics.errors,
+      hitRate: Number(hitRate.toFixed(2)),
+      totalRequests: this.metrics.totalRequests,
+      avgResponseTime: Number(avgResponseTime.toFixed(2)),
+      timestamp: new Date(),
+    };
+  }
+
+  /**
+   * Reset metrics.
+   */
+  resetMetrics(): void {
+    this.metrics = {
+      hits: 0,
+      misses: 0,
+      errors: 0,
+      totalRequests: 0,
+      responseTimes: [],
+    };
+
+    this.logger.log('Cache metrics reset');
+  }
+
+  /**
+   * Get cache alerts based on performance.
+   */
+  getAlerts(): string[] {
+    const alerts: string[] = [];
+    const metrics = this.getMetrics();
+
+    // Alert if hit rate is too low.
+    if (metrics.hitRate < 30 && metrics.totalRequests > 100) {
+      alerts.push(`⚠️ Low cache hit rate: ${metrics.hitRate}%`);
+    }
+
+    // Alert if average response time is high.
+    if (metrics.avgResponseTime > 100) {
+      alerts.push(`⚠️ High average response time: ${metrics.avgResponseTime}ms`);
+    }
+
+    // Alert if error rate is too high.
+    const errorRate =
+      metrics.totalRequests > 0 ? (metrics.errors / metrics.totalRequests) * 100 : 0;
+    if (errorRate > 5 && metrics.totalRequests > 50) {
+      alerts.push(`⚠️ High cache error rate: ${errorRate.toFixed(2)}%`);
+    }
+
+    return alerts;
+  }
+
+  /**
+   * Log cache performance summary.
+   */
+  logSummary(): void {
+    const metrics = this.getMetrics();
+
+    this.logger.log(
+      `Cache Performance - Hits: ${metrics.hits}, Misses: ${metrics.misses}, ` +
+        `Hit Rate: ${metrics.hitRate}%, Avg Response: ${metrics.avgResponseTime}ms`,
+    );
+  }
+}

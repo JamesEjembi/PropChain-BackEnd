@@ -1,255 +1,147 @@
-# API Versioning Implementation Guide
+# API Versioning — Consumer Guide
 
 ## Overview
 
-The API versioning system provides a comprehensive solution for managing different API versions with support for:
-- Multiple version extraction strategies (URL path, headers, query parameters)
-- Version deprecation policies with timeline-based warnings
-- Backward compatibility through response transformations
-- Version-specific feature flags
+PropChain uses **URI path-based API versioning**. The current version is **v2** (active). **v1** is deprecated and will sunset on **2026-12-31**.
 
-## Version Strategy
+## Specifying a Version
 
-### Supported Versions
+### Required: URL Path
 
-| Version | Status | Release Date | Deprecation Date | Sunset Date |
-|---------|--------|--------------|------------------|-------------|
-| 1.0 | Active | 2024-01-01 | - | - |
-| 2.0 | Active | 2025-06-01 | 2026-06-01 | 2026-12-01 |
+All API requests MUST include the version in the URL path:
 
-### Version Extraction
-
-The API supports multiple ways to specify the version:
-
-1. **URL Path** (recommended):
-   ```
-   GET /api/v1/properties
-   GET /api/v2/properties
-   ```
-
-2. **Header**:
-   ```
-   Accept-Version: 1.0
-   ```
-
-3. **Query Parameter**:
-   ```
-   GET /api/properties?version=1.0
-   ```
-
-### Default Version
-
-If no version is specified, the API defaults to version `1.0`.
-
-## Versioning Implementation
-
-### Middleware
-
-The [`ApiVersionMiddleware`](src/common/api-version/middleware/api-version.middleware.ts) extracts and validates the API version from incoming requests.
-
-```typescript
-// Applying middleware globally
-consumer
-  .apply(ApiVersionMiddleware)
-  .forRoutes('*');
+```
+GET /api/v2/properties
+GET /api/v2/users/me
+POST /api/v2/auth/login
 ```
 
-### Guard
+**Note:** The version in the URL path is the authoritative source for API versioning. Header-based versioning is not supported for new implementations.
 
-The [`ApiVersionGuard`](src/common/api-version/guards/api-version.guard.ts) enforces version requirements and deprecation policies.
+### Legacy Support
 
-```typescript
-// Using decorators on controllers/endpoints
-@Controller('properties')
-class PropertiesController {
-  @Get()
-  @RequiresVersion('2.0')
-  async getProperties() { }
+For backward compatibility with existing v1 consumers, the following legacy methods are still accepted but **should not be used for new integrations**:
 
-  @Get(':id')
-  @Deprecated('1.0', '/api/v2/properties/{id}')
-  async getProperty() { }
-}
-```
+- `API-Version` header: `API-Version: v2`
+- `Accept` header: `Accept: application/vnd.propchain.v2+json`
 
-### Interceptor
+These legacy methods will be removed when v1 is sunset on **2026-12-31**.
 
-The [`ApiVersionInterceptor`](src/common/api-version/interceptors/api-version.interceptor.ts) adds version metadata to responses and handles backward compatibility.
+### Default Behavior
 
-```typescript
-// Response includes version metadata
-{
-  "data": [...],
-  "_metadata": {
-    "version": "1.0",
-    "timestamp": "2025-03-24T12:00:00Z",
-    "deprecated": false
-  }
-}
-```
+If no version is specified in the URL path, the request defaults to **v2** for security and stability reasons.
 
-### Response Headers
+## Version Status
 
-The API adds the following headers to responses:
-
-- `X-API-Version`: The version being used (e.g., "1.0")
-- `X-API-Versions-Available`: Comma-separated list of supported versions
-- `Deprecation`: Header indicating deprecated versions
-- `Warning`: Warning header for deprecated versions
-- `Link`: Migration guide link for deprecated versions
+| Version | Status     | Released   | Sunset Date |
+| ------- | ---------- | ---------- | ----------- |
+| v1      | Deprecated | 2026-01-01 | 2026-12-31  |
+| v2      | Active     | 2026-04-01 | —           |
 
 ## Deprecation Policy
 
-### Timeline
+When a version is deprecated:
 
-1. **Active**: Full support with new features
-2. **Deprecated**: Still functional but shows warnings
-3. **Sunset**: No longer available, returns 410 Gone
+1. **Response headers** include deprecation warnings:
+   - `Deprecation: true`
+   - `Sunset: <date>`
+   - `Link: <next-version-docs>; rel="successor-version"`
 
-### Deprecation Headers
+2. **Console warnings** are logged on the server for deprecated-version requests.
 
-When using a deprecated version:
+3. A **6-month overlap** period exists where both versions remain functional.
 
+## Breaking Changes
+
+Breaking changes only occur in new major versions. Within a version:
+
+- New fields may be added to responses ( additive )
+- Existing fields will not be removed or renamed
+- Response codes will not change for existing success paths
+- New optional parameters may be added to requests
+
+## v1 Response Freezing
+
+To ensure backward compatibility until the sunset date, **v1 responses are frozen** as of 2026-09-27. This means:
+
+- v1 endpoint responses are guaranteed to remain stable until 2026-12-31
+- Any changes to response schemas will only affect v2 endpoints
+- Automated CI tests detect drift between v1 and v2 responses
+- v1 responses are snapshot-tested to prevent unintended changes
+
+### Key Endpoints with Frozen v1 Responses
+
+The following critical endpoints have frozen v1 response schemas:
+
+- Authentication: `/api/v1/auth/login`, `/api/v1/auth/register`, `/api/v1/auth/refresh`
+- Users: `/api/v1/users/me`, `/api/v1/users/me/profile`
+- Properties: `/api/v1/properties`, `/api/v1/properties/:id`, `/api/v1/properties/search`
+- Transactions: `/api/v1/transactions`, `/api/v1/transactions/:id`
+- Search: `/api/v1/search/properties`, `/api/v1/search/suggestions`
+- Dashboard: `/api/v1/dashboard`
+
+If you need to add new fields or modify response structures, these changes MUST be version-specific:
+- Add new fields only to v2 responses
+- Use the `@ApiVersion` decorator to specify version-specific behavior
+- Ensure v1 transformers in `backward-compatibility.service` strip v2-only fields
+
+## Migration from v1 to v2
+
+Key differences:
+
+- **URI path versioning is now required** (no more header-based versioning)
+- New fields may be present in v2 responses
+- Response format standardized across all endpoints
+- Enhanced error responses with detailed validation messages
+
+To migrate, update your base URL:
+
+```diff
+- GET https://api.propchain.io/api/v1/properties
++ GET https://api.propchain.io/api/v2/properties
 ```
-Deprecation: version="1.0"
-Warning: 299 - "API version 1.0 is deprecated"
-Link: </docs/migrations/v1-to-v2>; rel="migration-guide"
-```
 
-### Client Actions
+### Migration Checklist
 
-Clients should:
-1. Monitor `Deprecation` and `Warning` headers
-2. Plan migration within deprecation window
-3. Use `Link` header for migration guides
+- [ ] Update all API calls to include version in URL path
+- [ ] Remove any `API-Version` or custom `Accept` headers
+- [ ] Test your application with v2 endpoints
+- [ ] Review v2 response schemas for new fields
+- [ ] Update any code that depends on specific field ordering
+- [ ] Plan to complete migration before 2026-12-31
 
-## Version Compatibility
+## Monitoring Deprecated Usage
 
-### Breaking Changes
+Check the URL path in your API calls. If you see `/api/v1/`, migrate to `/api/v2/` before the sunset date.
 
-Version 2.0 includes these breaking changes:
+Additionally, deprecated endpoints return these response headers:
+- `Deprecation: true`
+- `Sunset: <date>`
+- `Warning: 299 - "API version v1 is deprecated and will be sunset in X days"`
 
-1. **Response Structure**: Changed response format for property endpoints
-2. **Authentication Flow**: Updated authentication mechanism
-3. **Transaction Format**: Modified transaction object structure
+## Developer Guidelines
 
-### Backward Compatibility
+When modifying endpoints that support multiple versions:
 
-The interceptor automatically transforms responses to maintain backward compatibility:
+1. **Always specify version support** using the `@ApiVersion` decorator
+2. **Add new fields only to v2** - never modify v1 response shapes
+3. **Use transformers** in `backward-compatibility.service` to strip v2 fields for v1
+4. **Run snapshot tests** to ensure v1 responses remain stable
+5. **Update this documentation** when adding version-specific behavior
+
+Example of version-specific endpoint:
 
 ```typescript
-// For v1 clients accessing v2 endpoints
-// Responses are transformed to v1 format automatically
-```
-
-### Compatibility Checking
-
-Use the [`ApiVersionService`](src/common/api-version/services/api-version.service.ts) to check version compatibility:
-
-```typescript
-constructor(private versionService: ApiVersionService) {}
-
-checkVersion() {
-  const result = this.versionService.checkCompatibility('1.0', '2.0');
-  // Returns compatibility level and recommended version
+@ApiVersion([ApiVersionEnum.V1, ApiVersionEnum.V2])
+@Get('properties')
+async getProperties(@GetVersion() version: ApiVersionEnum) {
+  const properties = await this.propertiesService.findAll();
+  // Return v1-shaped response for v1 requests
+  if (version === ApiVersionEnum.V1) {
+    return this.backwardCompatibilityService.transformV2ToV1(properties, 'property');
+  }
+  return properties; // v2 includes all fields
 }
 ```
 
-## Feature Flags
-
-Version-specific features can be checked:
-
-```typescript
-const feature = this.versionService.getFeatureAvailability('advancedFilters', '1.0');
-// { feature: 'advancedFilters', available: false, minimumVersion: '2.0' }
-```
-
-## Configuration
-
-### Environment Variables
-
-```env
-# Enable/disable API versioning
-API_VERSIONING_ENABLED=true
-
-# Default API version
-API_DEFAULT_VERSION=1.0
-```
-
-### Custom Deprecation Timeline
-
-```typescript
-// Configure custom deprecation periods
-versionService.setDeprecationConfig({
-  warnAfterDays: 30,    // Start warnings 30 days before sunset
-  errorAfterDays: 60,  // Return errors 60 days before sunset
-  sunsetAfterDays: 90,  // Fully sunset after 90 days
-});
-```
-
-## Migration Guide
-
-### From v1.0 to v2.0
-
-1. Update version in requests:
-   - Change `/api/v1/` to `/api/v2/` in URLs, OR
-   - Add header `Accept-Version: 2.0`
-
-2. Update response handling:
-   - Response structure has changed
-   - Check `_metadata` for version information
-
-3. Authentication:
-   - New authentication flow with enhanced token refresh
-
-4. Transaction format:
-   - New `transactionId` format
-   - Additional `metadata` field
-
-## Testing Versioning
-
-```typescript
-// Test version extraction
-const result = versionService.checkCompatibility('1.0', '2.0');
-expect(result.isCompatible).toBe(false);
-expect(result.compatibilityLevel).toBe(CompatibilityLevel.BREAKING);
-```
-
-## Error Responses
-
-### Unsupported Version (400)
-```json
-{
-  "error": "Unsupported API Version",
-  "message": "Version \"3.0\" is not supported",
-  "supportedVersions": ["1.0", "2.0"],
-  "code": "UNSUPPORTED_VERSION"
-}
-```
-
-### Version Required (412)
-```json
-{
-  "error": "Version Required",
-  "message": "This endpoint requires version 2.0",
-  "requiredVersion": "2.0",
-  "currentVersion": "1.0"
-}
-```
-
-### Version Sunset (410)
-```json
-{
-  "error": "Version Sunset",
-  "message": "API version 1.0 has been sunset",
-  "sunsetDate": "2026-12-01"
-}
-```
-
-## Best Practices
-
-1. **Always specify version**: Include version in all API requests
-2. **Monitor headers**: Watch for deprecation warnings
-3. **Plan migrations**: Migrate before sunset dates
-4. **Test thoroughly**: Verify compatibility between versions
-5. **Use latest versions**: Prefer the latest stable version
+For questions, contact support@propchain.com.

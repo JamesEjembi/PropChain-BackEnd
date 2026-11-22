@@ -1,232 +1,126 @@
-import {
-  Module,
-  NestModule,
-  MiddlewareConsumer,
-  ClassSerializerInterceptor,
-} from '@nestjs/common';
-import { ConfigModule, ConfigService } from '@nestjs/config';
-import { ThrottlerModule } from '@nestjs/throttler';
+import { Module, NestModule, MiddlewareConsumer } from '@nestjs/common';
+import { ConfigModule } from '@nestjs/config';
 import { ScheduleModule } from '@nestjs/schedule';
-import { TerminusModule } from '@nestjs/terminus';
-import { BullModule } from '@nestjs/bull';
-import { APP_INTERCEPTOR, APP_FILTER } from '@nestjs/core';
-
-// Core & Database
-import { PrismaModule } from './database/prisma/prisma.module';
-import { HealthModule } from './health/health.module';
-import { ConfigurationModule } from './config/configuration.module';
-import configuration from './config/configuration';
-import valuationConfig from './config/valuation.config';
-import observabilityConfig from './config/observability.config';
-
-// Caching
-import { CacheModule } from './common/cache/cache.module';
-
-// Logging
-import { LoggingModule } from './common/logging/logging.module';
-import { LoggingInterceptor } from './common/logging/logging.interceptor';
-import { ResponseInterceptor } from './common/interceptors/response.interceptor';
-import { AllExceptionsFilter } from './common/errors/error.filter';
-
-// I18n
-import {
-  I18nModule,
-  AcceptLanguageResolver,
-  QueryResolver,
-  HeaderResolver,
-} from 'nestjs-i18n';
-import * as path from 'path';
-
-// Redis
-import { RedisModule } from './common/services/redis.module';
-import { createRedisConfig } from './common/services/redis.config';
-
-// Business Modules
-import { PropertiesModule } from './properties/properties.module';
 import { UsersModule } from './users/users.module';
-import { TransactionsModule } from './transactions/transactions.module';
-import { DonationsModule } from './donations/donations.module';
-import { WithdrawalsModule } from './withdrawals/withdrawals.module';
-import { BlockchainModule } from './blockchain/blockchain.module';
 import { AuthModule } from './auth/auth.module';
-import { FilesModule } from './files/files.module';
-import { ValuationModule } from './valuation/valuation.module';
-import { ApiKeysModule } from './api-keys/api-keys.module';
+import { DashboardModule } from './dashboard/dashboard.module';
+import { SessionsModule } from './sessions/sessions.module';
+import { TrustScoreModule } from './trust-score/trust-score.module';
+import { PropertiesModule } from './properties/properties.module';
 import { DocumentsModule } from './documents/documents.module';
-import { SecurityModule } from './security/security.module';
-import { BackupRecoveryModule } from './backup-recovery/backup-recovery.module';
-
-// Compliance & Security Modules
-import { AuditModule } from './common/audit/audit.module';
-import { RbacModule } from './rbac/rbac.module';
-import { AuditController } from './common/controllers/audit.controller';
-
-// API Versioning
-import { ApiVersionModule } from './common/api-version';
-
-// Feature Flags
-import { FeatureFlagModule } from './feature-flags/feature-flag.module';
-
-// Static Cache
-import { StaticCacheModule } from './static-cache/static-cache.module';
-
-// Data Export
-import { ExportModule } from './export/export.module';
-
-// Compression
-import { CompressionModule } from './common/modules/compression.module';
-import { CompressionController } from './common/controllers/compression.controller';
-
-// Middleware
-import { HeaderValidationMiddleware } from './security/middleware/header-validation.middleware';
-import { RateLimitMiddleware } from './security/middleware/rate-limit.middleware';
-import { RequestValidationInterceptor } from './security/api/request.validation';
-import { StaticCacheMiddleware } from './static-cache/middleware/static-cache.middleware';
-import { ObservabilityModule } from './observability/observability.module';
-import { BoundaryValidationModule } from './common/validation';
+import { PrismaModule } from './database/prisma.module';
+import { VersioningModule } from './versioning/versioning.module';
+import { ApiDocumentationModule } from './config/api-documentation.module';
+import { CacheModuleConfig } from './cache/cache.module';
+import { AnalyticsModule } from './analytics/analytics.module';
+import { IntegrationsModule } from './integrations/integrations.module';
+import { AppController } from './app.controller';
+import './common/common.types'; // Load registered enums
+import { RequestIdMiddleware } from './common/request-id.middleware';
+import { AdminModule } from './admin/admin.module';
+import { FraudModule } from './fraud/fraud.module';
+import { SearchModule } from './search/search.module';
+import { BackupModule } from './backup/backup.module';
+import { TrackingModule } from './tracking/tracking.module';
+import { NotificationsModule } from './notifications/notifications.module';
+import { BlockchainModule } from './blockchain/blockchain.module';
+import { TransactionsModule } from './transactions/transactions.module';
+import { CommissionsModule } from './commissions/commissions.module';
+import { FavoritesModule } from './favorites/favorites.module';
+import { PropertyViewsModule } from './property-views/property-views.module';
+import { PropertyComparisonModule } from './property-comparison/property-comparison.module';
+import { OpenHouseModule } from './open-house/open-house.module';
+import { MortgageCalculatorModule } from './mortgage-calculator/mortgage-calculator.module';
+import { PaymentModule } from './payment/payment.module';
+import { InvestmentModule } from './investment/investment.module';
+import { SupportTicketsModule } from './support-tickets/support-tickets.module';
+import { AuditModule } from './audit/audit.module';
+import { MetricsModule } from './metrics/metrics.module';
+import { PropertyTaxModule } from './properties/tax/property-tax.module';
+import { ResponseFormatInterceptor } from './common/interceptors/response-format.interceptor';
+import { VersionHeaderInterceptor } from './versioning/version-header.interceptor';
+import { DeprecationWarningInterceptor } from './versioning/deprecation-warning.interceptor';
+import { RateLimitHeadersInterceptor } from './auth/interceptors/rate-limit-headers.interceptor';
+// Issue #925 – K8s health probes
+import { HealthModule } from './health/health.module';
+import { InvestmentsModule } from './investments/investments.module';
+// Issue #919 – Data archival strategy
+import { ArchiveModule } from './archive/archive.module';
+// Issue #920 – Automated cleanup of expired records
+import { CleanupService } from './database/cleanup.service';
+// Issue #964 – Localized error messages with i18n
+import { I18nModule } from './i18n/i18n.module';
+import { HttpExceptionFilter } from './common/filters/http-exception.filter';
+import { PrismaExceptionFilter } from './common/filters/prisma-exception.filter';
+import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
+import { ValidationExceptionFilter } from './common/filters/validation-exception.filter';
+import { APP_FILTER } from '@nestjs/core';
 
 @Module({
   imports: [
-    // Configuration
     ConfigModule.forRoot({
       isGlobal: true,
-      load: [configuration, valuationConfig, observabilityConfig],
-      envFilePath: [
-        `.env.${process.env.NODE_ENV || 'development'}.local`,
-        `.env.${process.env.NODE_ENV || 'development'}`,
-        '.env.local',
-        '.env',
-      ],
-      cache: true,
-      expandVariables: true,
+      envFilePath: ['.env.local', '.env'],
     }),
-
-    ConfigurationModule,
-    BoundaryValidationModule,
-
-    // I18n
-    I18nModule.forRootAsync({
-      useFactory: (configService: ConfigService) => ({
-        fallbackLanguage: configService.getOrThrow('FALLBACK_LANGUAGE', 'en'),
-        loaderOptions: {
-          path: path.join(__dirname, '/i18n/'),
-          watch: true,
-        },
-      }),
-      resolvers: [
-        { use: QueryResolver, options: ['lang'] },
-        AcceptLanguageResolver,
-        new HeaderResolver(['x-lang']),
-      ],
-      inject: [ConfigService],
-    }),
-
-    // Caching
-    CacheModule,
-
-    // Core
-    LoggingModule,
-    PrismaModule,
-    HealthModule,
-    RedisModule,
-
-    // Observability
-    ObservabilityModule,
-
-    // Security & rate limiting
-    ThrottlerModule.forRootAsync({
-      imports: [ConfigModule],
-      inject: [ConfigService],
-      useFactory: (configService: ConfigService) => [
-        {
-          ttl: configService.get<number>('THROTTLE_TTL', 60),
-          limit: configService.get<number>('THROTTLE_LIMIT', 10),
-        },
-      ],
-    }),
-
-    // Background jobs
-    BullModule.forRootAsync({
-      imports: [ConfigModule],
-      inject: [ConfigService],
-      useFactory: createRedisConfig,
-    }),
-
-    // Scheduling & health
     ScheduleModule.forRoot(),
-    TerminusModule,
-
-    // Business
-    AuthModule,
-    ApiKeysModule,
+    CacheModuleConfig,
+    AnalyticsModule,
+    PrismaModule,
+    VersioningModule,
+    I18nModule,
+    ApiDocumentationModule,
     UsersModule,
+    AuthModule,
+    DashboardModule,
+    SessionsModule,
+    TrustScoreModule,
     PropertiesModule,
-    TransactionsModule,
-    BlockchainModule,
-    FilesModule,
-    ValuationModule,
+    AdminModule,
+    FraudModule,
     DocumentsModule,
-    SecurityModule,
-
-    // Compliance & Security
+    IntegrationsModule,
+    SearchModule,
+    BackupModule,
+    TrackingModule,
+    NotificationsModule,
+    BlockchainModule,
+    TransactionsModule,
+    CommissionsModule,
+    FavoritesModule,
+    PropertyViewsModule,
+    PropertyComparisonModule,
+    OpenHouseModule,
+    MortgageCalculatorModule,
+    InvestmentsModule,
+    SupportTicketsModule,
     AuditModule,
-    RbacModule,
-
-    // API Versioning
-    ApiVersionModule,
-    BackupRecoveryModule,
-
-    // Feature Flags
-    FeatureFlagModule,
-
-    // Static Cache
-    StaticCacheModule,
-
-    // Data Export
-    ExportModule,
-
-    // Donations
-    DonationsModule,
-    WithdrawalsModule,
-
-    // Compression
-    CompressionModule,
+    MetricsModule,
+    PropertyTaxModule,
+    HealthModule,
+    InvestmentsModule,
+    ArchiveModule,
+    PaymentModule,
+    InvestmentModule,
   ],
-  controllers: [
-    AuditController,
-    CompressionController,
-  ],
+
+  controllers: [AppController],
   providers: [
-    {
-      provide: APP_INTERCEPTOR,
-      useClass: ClassSerializerInterceptor,
-    },
-    {
-      provide: APP_INTERCEPTOR,
-      useClass: RequestValidationInterceptor,
-    },
-    {
-      provide: APP_INTERCEPTOR,
-      useClass: ResponseInterceptor,
-    },
-    {
-      provide: APP_INTERCEPTOR,
-      useClass: LoggingInterceptor,
-    },
-    {
-      provide: APP_FILTER,
-      useClass: AllExceptionsFilter,
-    },
+    ResponseFormatInterceptor,
+    VersionHeaderInterceptor,
+    DeprecationWarningInterceptor,
+    RateLimitHeadersInterceptor,
+    // Issue #920 – Cleanup service registers the @Cron scheduler
+    CleanupService,
+    // Issue #964 – Register the i18n-aware exception filters globally via
+    // APP_FILTER so NestJS injects I18nService into them.
+    { provide: APP_FILTER, useClass: ValidationExceptionFilter },
+    { provide: APP_FILTER, useClass: PrismaExceptionFilter },
+    { provide: APP_FILTER, useClass: HttpExceptionFilter },
+    { provide: APP_FILTER, useClass: AllExceptionsFilter },
   ],
 })
 export class AppModule implements NestModule {
-  configure(consumer: MiddlewareConsumer) {
-    consumer
-      .apply(StaticCacheMiddleware)
-      .forRoutes('*')
-      .apply(HeaderValidationMiddleware)
-      .forRoutes('*')
-      .apply(RateLimitMiddleware)
-      .forRoutes('*');
+  configure(consumer: MiddlewareConsumer): void {
+    consumer.apply(RequestIdMiddleware).forRoutes('*');
   }
 }

@@ -1,0 +1,37 @@
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+import { Module, forwardRef } from '@nestjs/common';
+import { ConfigModule } from '@nestjs/config';
+import { NotificationsGateway } from './notifications.gateway';
+import { NotificationsService } from './notifications.service';
+import { NotificationsController } from './notifications.controller';
+import { RedisPresenceService } from './redis-presence.service';
+import { WsTicketService } from './ws-ticket.service';
+import { SessionsModule } from '../sessions/sessions.module';
+import {
+  SmsService,
+  SmsProviderFactory,
+  TwilioSmsProvider,
+  AwsSnsSmsProvider,
+  MockSmsProvider,
+} from './sms.service';
+import { PrismaModule } from '../database/prisma.module';
+import { EmailModule } from '../email/email.module';
+import { UsersModule } from '../users/users.module';
+
+@Module({
+  imports: [PrismaModule, EmailModule, UsersModule, ConfigModule, SessionsModule],
+  controllers: [NotificationsController],
+  providers: [
+    RedisPresenceService,
+    WsTicketService,
+    NotificationsGateway,
+    NotificationsService,
+    TwilioSmsProvider,
+    AwsSnsSmsProvider,
+    MockSmsProvider,
+    SmsProviderFactory,
+    SmsService,
+  ],
+  exports: [NotificationsService, SmsService, SmsProviderFactory],
+})
+export class NotificationsModule {}

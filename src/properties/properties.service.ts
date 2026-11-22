@@ -1,672 +1,1433 @@
-import { Injectable } from '@nestjs/common';
 import {
+  BadRequestException,
+  ConflictException,
+  ForbiddenException,
+  Injectable,
   NotFoundException,
-  UserNotFoundException,
-  InvalidInputException,
-  BusinessRuleViolationException,
-} from '../common/errors/custom.exceptions';
-import { PrismaService } from '../database/prisma/prisma.service';
-import { CreatePropertyDto, PropertyStatus as DTOPropertyStatus } from './dto/create-property.dto';
-import { UpdatePropertyDto } from './dto/update-property.dto';
-import { PropertyQueryDto } from './dto/property-query.dto';
-import { ConfigService } from '@nestjs/config';
-import { MultiLevelCacheService } from '../common/cache/multi-level-cache.service';
-import { BaseService } from '../common/services/base.service';
-import { BoundaryValidationService } from '../common/validation';
+  Optional,
+} from '@nestjs/common';
+import { AppLogger } from '../common/logger';
+import { Decimal } from '@prisma/client/runtime/library';
+import { Prisma } from '@prisma/client';
+import { PrismaService } from '../database/prisma.service';
+import { CreatePropertyDto, UpdatePropertyDto } from './dto/property.dto';
+import { AssignAgentDto, UpdateAgentAssignmentDto } from './dto/agent-assignment.dto';
+import { AuthUserPayload } from '../auth/types/auth-user.type';
+import { SearchPropertiesDto } from './dto/search-properties.dto';
+import { CreateAmenityDto, UpdateAmenityDto } from './dto/amenity.dto';
+import { FraudService } from '../fraud/fraud.service';
+import { GeocodingService } from './geocoding.service';
+import { PropertyStatus, UserRole } from '../types/prisma.types';
+import { retryListingQuery } from './listing-retry.util';
+import { CacheService } from '../cache/cache.service';
+import { CACHE_TAGS } from '../cache/cache.config';
+import { PropertiesListingsCacheService } from './properties-listings-cache.service';
+import { PropertiesCacheService } from './properties-cache.service';
+import {
+  canTransitionPropertyStatus,
+  getAllowedNextPropertyStatuses,
+  DEFAULT_PROPERTY_STATUS,
+} from './property-status.constants';
+import { propertiesTotal } from '../metrics/metrics.controller';
+import { isTransientGeocodeError, retryWithBackoff } from './retry.util';
+import { buildSearchWhereClause } from './search-where.builder';
+
+interface FindAllParams {
+  skip?: number;
+  take?: number;
+  where?: Record<string, unknown>;
+  orderBy?: Record<string, 'asc' | 'desc'>;
+}
 
 /**
- * Properties Service
- *
- * Manages the lifecycle of real estate properties including:
- * - Creation and address formatting
- * - Search with complex filtering (price, area, bedrooms, etc.)
- * - Caching and cache invalidation
- * - Property statistics and analytics
- *
- * @class PropertiesService
+ * How many filters a search actually carried. Logged so a slow or empty search
+ * can be attributed to a specific query shape without logging the values
+ * themselves, which would put addresses and owner data into the log stream.
+ * Paging and sorting are excluded: they are not filters and `page`/`limit` are
+ * always present because the DTO defaults them.
  */
+const NON_FILTER_SEARCH_FIELDS = new Set(['page', 'limit', 'sortBy', 'sortOrder']);
+
+function countSearchFilters(dto: SearchPropertiesDto): number {
+  const entries = Object.entries((dto ?? {}) as Record<string, unknown>);
+  return entries.filter(
+    ([key, value]) => !NON_FILTER_SEARCH_FIELDS.has(key) && value !== undefined && value !== null,
+  ).length;
+}
+
+export interface PaginatedPropertiesResult<T = unknown> {
+  items: T[];
+  total: number;
+  page: number;
+  limit: number;
+  totalPages: number;
+}
+
 @Injectable()
-export class PropertiesService extends BaseService {
+export class PropertiesService {
+  private geocodeRateLimitWindow = 60 * 1000;
+  private geocodeMaxPerMinute = 50;
+  private geocodeTimestamps: number[] = [];
+
   constructor(
     private readonly prisma: PrismaService,
-    private readonly configService: ConfigService,
-    private readonly cacheService: MultiLevelCacheService,
-    boundaryValidation: BoundaryValidationService,
-  ) {
-    super(boundaryValidation, PropertiesService.name);
+    private readonly fraudService: FraudService,
+    private readonly geocodingService: GeocodingService,
+    private readonly cacheService: CacheService,
+    @Optional() private readonly listingsCache?: PropertiesListingsCacheService,
+    @Optional() private readonly propertiesCache?: PropertiesCacheService,
+  ) {}
+
+  /**
+   * Drop the cached detail view of a property. Best-effort: a cache failure is
+   * logged and ignored, because the entry also expires on its own within the TTL.
+   */
+  private async invalidateCachedProperty(propertyId: string): Promise<void> {
+    if (!this.propertiesCache) return;
+    try {
+      await this.propertiesCache.invalidateProperty(propertyId);
+    } catch (err) {
+      this.logger.warn('Property detail cache invalidation failed', {
+        event: 'properties.detail_cache_invalidation_failed',
+        propertyId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  private async checkGeocodeRateLimit(): Promise<boolean> {
+    const now = Date.now();
+    this.geocodeTimestamps = this.geocodeTimestamps.filter(
+      (t) => now - t < this.geocodeRateLimitWindow,
+    );
+    return this.geocodeTimestamps.length < this.geocodeMaxPerMinute;
+  }
+
+  private async recordGeocodeCall(): Promise<void> {
+    this.geocodeTimestamps.push(Date.now());
+  }
+
+  private async shouldGeocode(
+    propertyId: string,
+    addressFields: {
+      address: string;
+      city: string;
+      state: string;
+      zipCode: string;
+      country: string;
+    },
+  ): Promise<boolean> {
+    const existing = await this.prisma.property.findUnique({
+      where: { id: propertyId },
+      select: {
+        address: true,
+        city: true,
+        state: true,
+        zipCode: true,
+        country: true,
+        latitude: true,
+        longitude: true,
+      },
+    });
+
+    if (!existing) return false;
+    if (existing.latitude && existing.longitude) return false;
+    return this.geocodingService.hasAddressChanged(
+      {
+        address: existing.address,
+        city: existing.city,
+        state: existing.state,
+        zipCode: existing.zipCode,
+        country: existing.country,
+      },
+      addressFields,
+    );
+  }
+
+  private async attemptGeocode(
+    propertyId: string,
+    addressFields: {
+      address: string;
+      city: string;
+      state: string;
+      zipCode: string;
+      country: string;
+    },
+  ): Promise<{ lat: number; lng: number } | null> {
+    if (!(await this.shouldGeocode(propertyId, addressFields))) {
+      return null;
+    }
+
+    if (!(await this.checkGeocodeRateLimit())) {
+      this.logger.warn('Geocoding rate limit hit', {
+        event: 'properties.geocode_rate_limited',
+        propertyId,
+      });
+      return null;
+    }
+
+    await this.recordGeocodeCall();
+
+    // Geocoding is an external HTTP provider, so a timeout or a 5xx is usually
+    // transient. Retry those a couple of times before giving up on coordinates;
+    // the property itself has already been validated at this point.
+    const geo = await retryWithBackoff(() => this.geocodingService.geocodeAddress(addressFields), {
+      attempts: 3,
+      baseDelayMs: 200,
+      maxDelayMs: 2_000,
+      isRetryable: isTransientGeocodeError,
+    }).catch(() => null);
+
+    if (!geo) {
+      await this.markGeocodingFailed(propertyId);
+      return null;
+    }
+
+    return { lat: geo.latitude, lng: geo.longitude };
+  }
+
+  private async markGeocodingFailed(propertyId: string): Promise<void> {
+    const existing = await this.prisma.property.findUnique({
+      where: { id: propertyId },
+      select: { metadata: true } as unknown as Prisma.PropertySelect,
+    });
+
+    const metadata =
+      ((existing as { metadata?: unknown } | null)?.metadata as Record<string, any>) || {};
+    await this.prisma.property.update({
+      where: { id: propertyId },
+      data: {
+        metadata: {
+          ...metadata,
+          regeocodingFailed: true,
+          regeocodingFailedAt: new Date().toISOString(),
+        },
+      } as any,
+    });
+  }
+
+  private readonly logger = new AppLogger('PropertiesService');
+
+  async create(createPropertyDto: CreatePropertyDto, ownerId: string) {
+    const { price, squareFeet, lotSize, latitude, longitude, hoaMonthlyFee, ...rest } =
+      createPropertyDto;
+
+    // Duplicate address check
+    const duplicate = await this.prisma.property.findFirst({
+      where: {
+        address: rest.address,
+        city: rest.city,
+        state: rest.state,
+        zipCode: rest.zipCode,
+        country: rest.country,
+      },
+    });
+    if (duplicate) {
+      throw new BadRequestException('A property with this address already exists.');
+    }
+
+    // Auto-geocode when the caller didn't supply coordinates explicitly.
+    let resolvedLat = latitude;
+    let resolvedLng = longitude;
+    if (resolvedLat === undefined || resolvedLng === undefined) {
+      const geo = await this.attemptGeocode('new', {
+        address: rest.address,
+        city: rest.city,
+        state: rest.state,
+        zipCode: rest.zipCode,
+        country: rest.country || 'USA',
+      });
+      if (geo) {
+        resolvedLat = geo.lat;
+        resolvedLng = geo.lng;
+      }
+    }
+
+    const property = await this.prisma.property.create({
+      data: {
+        ...rest,
+        price: new Decimal(price.toString()),
+        squareFeet: squareFeet ? new Decimal(squareFeet.toString()) : null,
+        lotSize: lotSize ? new Decimal(lotSize.toString()) : null,
+        hoaMonthlyFee: hoaMonthlyFee !== undefined ? new Decimal(hoaMonthlyFee.toString()) : null,
+        status: DEFAULT_PROPERTY_STATUS,
+        latitude: resolvedLat,
+        longitude: resolvedLng,
+        owner: {
+          connect: { id: ownerId },
+        },
+      },
+    });
+
+    propertiesTotal.inc();
+    this.logger.log('Property created', {
+      event: 'properties.created',
+      propertyId: property.id,
+      ownerId,
+    });
+
+    // The property already exists at this point. If a follow-up step fails, report
+    // it in the logs but still return the property: failing the request would make
+    // the client retry and hit the "address already exists" error for its own record.
+    try {
+      await this.fraudService.evaluatePropertyCreated(property.id);
+    } catch (err) {
+      this.logger.error('Fraud evaluation failed for new property', {
+        event: 'properties.fraud_evaluation_failed',
+        propertyId: property.id,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+    try {
+      await this.cacheService.invalidateByTag(CACHE_TAGS.PROPERTIES);
+    } catch (err) {
+      this.logger.warn('Property cache invalidation failed', {
+        event: 'properties.cache_invalidation_failed',
+        propertyId: property.id,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+    await this.invalidateCachedProperty(property.id);
+
+    return property;
+  }
+
+  async findAll(params?: FindAllParams) {
+    const { skip, take, where, orderBy } = params || {};
+    return (this.prisma.property as any).findMany({
+      skip,
+      take,
+      where: this.buildListingWhere(where),
+      // Without an explicit sort the database returned rows in arbitrary order, so
+      // `skip`/`take` paging could repeat or skip a property between calls. Default
+      // to newest first with `id` as a tie-breaker to make paging stable.
+      orderBy: orderBy ?? { createdAt: 'desc' as const, id: 'desc' as const },
+      include: this.listingRelations,
+    });
   }
 
   /**
-   * Create a new property listing
-   *
-   * Validates the owner existence, formats the address, and persists the property.
-   * Automatically invalidates relevant search and list caches.
-   *
-   * @param {CreatePropertyDto} createPropertyDto - Property details
-   * @param {string} ownerId - ID of the user owning the property
-   * @returns {Promise<Property>} The created property with owner info
-   *
-   * @throws {UserNotFoundException} If the owner ID is invalid
-   * @throws {InvalidInputException} If creation fails
-   *
-   * @example
-   * ```typescript
-   * const property = await propertiesService.create({
-   *   title: 'Luxury Penthouse',
-   *   description: 'Spacious 3-bedroom penthouse with city views',
-   *   address: { street: '123 Main St', city: 'London', country: 'UK' },
-   *   price: 1500000,
-   *   areaSqFt: 2500,
-   *   type: 'PENTHOUSE'
-   * }, 'user_uuid_123');
-   * ```
+   * `GET /properties` with paging. Returns the rows and the total that matches
+   * the same filter, so a client can render "page 2 of 7" without a second
+   * request. `findAll` is left as-is for callers that just want the rows.
    */
-  async create(createPropertyDto: CreatePropertyDto, ownerId: string) {
-    const input = await this.validateInput(CreatePropertyDto, createPropertyDto, 'create');
+  async findAllPaginated(
+    page: number,
+    limit: number,
+    params?: Omit<FindAllParams, 'skip' | 'take'>,
+  ): Promise<{ items: unknown[]; total: number }> {
+    const where = this.buildListingWhere(params?.where);
+    const skip = (page - 1) * limit;
 
-    try {
-      const owner = await (this.prisma as any).user.findUnique({
-        where: { id: ownerId },
-      });
+    const [items, total] = await this.prisma.$transaction([
+      (this.prisma.property as any).findMany({
+        skip,
+        take: limit,
+        where,
+        orderBy: params?.orderBy ?? { createdAt: 'desc' as const, id: 'desc' as const },
+        include: this.listingRelations,
+      }),
+      this.prisma.property.count({ where }),
+    ]);
 
-      if (!owner) {
-        throw new UserNotFoundException(ownerId);
-      }
+    return { items, total };
+  }
 
-      const location = this.formatAddress(input.address);
+  /** The public listing filter: never soft-deleted, and ACTIVE unless overridden. */
+  private buildListingWhere(where?: Record<string, unknown>): Record<string, unknown> {
+    return where
+      ? { ...where, status: where.status ?? PropertyStatus.ACTIVE, deleted: false }
+      : { status: PropertyStatus.ACTIVE, deleted: false };
+  }
 
-      const property = await (this.prisma as any).property.create({
-        data: {
-          title: input.title,
-          description: input.description,
-          location,
-          price: input.price,
-          status: this.mapPropertyStatus(input.status || DTOPropertyStatus.AVAILABLE),
-          ownerId,
-          bedrooms: input.bedrooms,
-          bathrooms: input.bathrooms,
-          squareFootage: input.areaSqFt,
-          propertyType: input.type,
+  /** Owner and assigned-agent payload shared by every listing read. */
+  private get listingRelations() {
+    return {
+      owner: {
+        select: {
+          id: true,
+          firstName: true,
+          lastName: true,
+          email: true,
         },
+      },
+      agents: {
+        include: {
+          agent: {
+            select: {
+              id: true,
+              firstName: true,
+              lastName: true,
+              email: true,
+              phone: true,
+            },
+          },
+        },
+      },
+    };
+  }
+
+  async findOne(id: string) {
+    const load = () =>
+      (this.prisma.property as any).findUnique({
+        where: { id },
         include: {
           owner: {
-            select: { id: true, email: true, role: true },
+            select: {
+              id: true,
+              firstName: true,
+              lastName: true,
+              email: true,
+            },
+          },
+          documents: true,
+          agents: {
+            include: {
+              agent: {
+                select: {
+                  id: true,
+                  firstName: true,
+                  lastName: true,
+                  email: true,
+                  phone: true,
+                },
+              },
+            },
           },
         },
       });
 
-      await this.invalidatePropertyReadCaches(property.id);
+    // Served from Redis when the module is wired with PropertiesCacheService.
+    if (!this.propertiesCache) return load();
+    return this.propertiesCache.rememberExistingProperty(id, load);
+  }
 
-      this.logger.log(`Property created: ${property.id} by user ${ownerId}`);
-      return property;
-    } catch (error) {
-      if (error instanceof UserNotFoundException || error instanceof InvalidInputException) {
-        throw error;
-      }
-      this.logger.error('Failed to create property', error);
-      throw new InvalidInputException(undefined, 'Failed to create property');
+  async update(id: string, updatePropertyDto: UpdatePropertyDto, userId?: string) {
+    const { price, squareFeet, lotSize, latitude, longitude, hoaMonthlyFee, ...rest } =
+      updatePropertyDto;
+
+    // Get existing property to check for price changes
+    const existingProperty = await this.prisma.property.findUnique({ where: { id } });
+    if (!existingProperty) throw new NotFoundException(`Property ${id} not found`);
+
+    // Record price change if price is being updated
+    if (price !== undefined && price !== Number(existingProperty.price)) {
+      const oldPrice = existingProperty.price;
+      const newPrice = new Decimal(price.toString());
+      const changeAmount = newPrice.minus(oldPrice);
+      const changePercentage = oldPrice.equals(new Decimal(0))
+        ? 0
+        : changeAmount.div(oldPrice).mul(100).toNumber();
+
+      await this.prisma.propertyPriceHistory.create({
+        data: {
+          propertyId: id,
+          oldPrice,
+          newPrice,
+          changeAmount,
+          changePercentage,
+          changedBy: userId,
+          changeReason: (rest as { changeReason?: string }).changeReason || null,
+        },
+      });
     }
+
+    // Duplicate address check (if address fields are being updated)
+    if (rest.address || rest.city || rest.state || rest.zipCode || rest.country) {
+      const newAddress = {
+        address: rest.address ?? existingProperty.address,
+        city: rest.city ?? existingProperty.city,
+        state: rest.state ?? existingProperty.state,
+        zipCode: rest.zipCode ?? existingProperty.zipCode,
+        country: rest.country ?? existingProperty.country,
+      };
+      const duplicate = await this.prisma.property.findFirst({
+        where: {
+          ...newAddress,
+          NOT: { id },
+        },
+      });
+      if (duplicate) {
+        throw new BadRequestException('A property with this address already exists.');
+      }
+    }
+
+    // If the user explicitly provided lat/lng, honor them. Otherwise,
+    // re-geocode when any address-defining field changes.
+    let resolvedLat = latitude;
+    let resolvedLng = longitude;
+    const callerProvidedCoords = latitude !== undefined && longitude !== undefined;
+
+    if (!callerProvidedCoords) {
+      const existing = await this.prisma.property.findUnique({
+        where: { id },
+        select: {
+          address: true,
+          city: true,
+          state: true,
+          zipCode: true,
+          country: true,
+          latitude: true,
+          longitude: true,
+        },
+      });
+
+      if (existing) {
+        const before = {
+          address: existing.address,
+          city: existing.city,
+          state: existing.state,
+          zipCode: existing.zipCode,
+          country: existing.country,
+        };
+        const after = {
+          address: rest.address ?? existing.address,
+          city: rest.city ?? existing.city,
+          state: rest.state ?? existing.state,
+          zipCode: rest.zipCode ?? existing.zipCode,
+          country: rest.country ?? existing.country,
+        };
+
+        if (this.geocodingService.hasAddressChanged(before, after)) {
+          if (existing.latitude && existing.longitude) {
+            resolvedLat = existing.latitude;
+            resolvedLng = existing.longitude;
+          } else {
+            const geo = await this.attemptGeocode(id, after);
+            if (geo) {
+              resolvedLat = geo.lat;
+              resolvedLng = geo.lng;
+            }
+          }
+        }
+      }
+    }
+
+    const updatedProperty = await this.prisma.property.update({
+      where: { id },
+      data: {
+        ...rest,
+        price: price ? new Decimal(price.toString()) : undefined,
+        squareFeet: squareFeet ? new Decimal(squareFeet.toString()) : undefined,
+        lotSize: lotSize ? new Decimal(lotSize.toString()) : undefined,
+        hoaMonthlyFee:
+          hoaMonthlyFee !== undefined ? new Decimal(hoaMonthlyFee.toString()) : undefined,
+        latitude: resolvedLat,
+        longitude: resolvedLng,
+        expiryDate: updatePropertyDto.expiryDate,
+      },
+    });
+
+    await this.cacheService.invalidateByTag(CACHE_TAGS.PROPERTIES);
+    await this.invalidateCachedProperty(id);
+    return updatedProperty;
+  }
+
+  async remove(id: string, user: AuthUserPayload) {
+    const property = await this.prisma.property.findUnique({
+      where: { id },
+    });
+
+    if (!property) {
+      throw new NotFoundException(`Property with ID ${id} not found`);
+    }
+
+    // Authorization check: only property owner or admin can delete
+    if (property.ownerId !== user.sub && user.role !== UserRole.ADMIN) {
+      throw new ForbiddenException('You are not authorized to delete this property');
+    }
+
+    const updated = await this.prisma.property.update({
+      where: { id },
+      data: {
+        deleted: true,
+        deletedAt: new Date(),
+        deletedById: user.sub,
+        status: PropertyStatus.ARCHIVED,
+      },
+    });
+
+    await this.cacheService.invalidateByTag(CACHE_TAGS.PROPERTIES);
+    await this.invalidateCachedProperty(id);
+    this.logger.warn('Property deleted', {
+      event: 'properties.deleted',
+      propertyId: id,
+      userId: user.sub,
+    });
+    return updated;
+  }
+
+  async restore(id: string, user: AuthUserPayload) {
+    const property = await this.prisma.property.findUnique({
+      where: { id },
+    });
+
+    if (!property) {
+      throw new NotFoundException(`Property with ID ${id} not found`);
+    }
+
+    // Authorization check: only admin can restore
+    if (user.role !== UserRole.ADMIN) {
+      throw new ForbiddenException('You are not authorized to restore this property');
+    }
+
+    const updated = await this.prisma.property.update({
+      where: { id },
+      data: {
+        deleted: false,
+        deletedAt: null,
+        deletedById: null,
+        status: PropertyStatus.DRAFT, // Or the original status before deletion
+      },
+    });
+
+    await this.cacheService.invalidateByTag(CACHE_TAGS.PROPERTIES);
+    await this.invalidateCachedProperty(id);
+    this.logger.log('Property restored', {
+      event: 'properties.restored',
+      propertyId: id,
+      userId: user.sub,
+    });
+    return updated;
+  }
+
+  async findByOwnerId(ownerId: string) {
+    return this.prisma.property.findMany({
+      where: { ownerId },
+      orderBy: { createdAt: 'desc', id: 'desc' },
+    });
   }
 
   /**
-   * Search and filter properties with pagination
-   *
-   * Supports advanced filtering by:
-   * - Text search (title, description, location)
-   * - Numeric ranges (price, bedrooms, bathrooms, area)
-   * - Property status and type
-   *
-   * Results are cached for 5 minutes by query fingerprint.
-   *
-   * @param {PropertyQueryDto} query - Search and pagination parameters
-   * @returns {Promise<PaginatedPropertyResponse>} Properties and metadata
-   *
-   * @example
-   * ```typescript
-   * const result = await propertiesService.findAll({
-   *   page: 1,
-   *   limit: 10,
-   *   minPrice: 500000,
-   *   maxPrice: 2000000,
-   *   type: 'PENTHOUSE',
-   *   search: 'London'
-   * });
-   * ```
+   * Expire properties that have passed their expiry date.
+   * This method should be called periodically by a scheduled job.
    */
-  async findAll(query?: PropertyQueryDto) {
-    const normalizedQuery = query
-      ? await this.validateInput(PropertyQueryDto, query, 'findAll', { skipMissingProperties: true })
-      : undefined;
-
-    const {
-      page = 1,
-      limit = 20,
-      sortBy = 'createdAt',
-      sortOrder = 'desc',
-      search,
-      type,
-      status,
-      city,
-      country,
-      minPrice,
-      maxPrice,
-      minBedrooms,
-      maxBedrooms,
-      minBathrooms,
-      maxBathrooms,
-      minArea,
-      maxArea,
-      ownerId,
-    } = normalizedQuery || {};
-
-    const skip = (page - 1) * limit;
-    const where: Record<string, any> = {};
-
-    if (search) {
-      where.OR = [
-        { title: { contains: search, mode: 'insensitive' } },
-        { description: { contains: search, mode: 'insensitive' } },
-        { location: { contains: search, mode: 'insensitive' } },
-      ];
-    }
-
-    if (type) {
-      where.propertyType = type;
-    }
-
-    if (status) {
-      where.status = this.mapPropertyStatus(status);
-    }
-
-    if (city || country) {
-      const locationParts: string[] = [];
-      if (city) {
-        locationParts.push(city);
-      }
-      if (country) {
-        locationParts.push(country);
-      }
-      where.location = { contains: locationParts.join(', '), mode: 'insensitive' };
-    }
-
-    if (minPrice !== undefined || maxPrice !== undefined) {
-      where.price = {};
-      if (minPrice !== undefined) {
-        where.price.gte = minPrice;
-      }
-      if (maxPrice !== undefined) {
-        where.price.lte = maxPrice;
-      }
-    }
-
-    if (minBedrooms !== undefined || maxBedrooms !== undefined) {
-      where.bedrooms = {};
-      if (minBedrooms !== undefined) {
-        where.bedrooms.gte = minBedrooms;
-      }
-      if (maxBedrooms !== undefined) {
-        where.bedrooms.lte = maxBedrooms;
-      }
-    }
-
-    if (minBathrooms !== undefined || maxBathrooms !== undefined) {
-      where.bathrooms = {};
-      if (minBathrooms !== undefined) {
-        where.bathrooms.gte = minBathrooms;
-      }
-      if (maxBathrooms !== undefined) {
-        where.bathrooms.lte = maxBathrooms;
-      }
-    }
-
-    if (minArea !== undefined || maxArea !== undefined) {
-      where.squareFootage = {};
-      if (minArea !== undefined) {
-        where.squareFootage.gte = minArea;
-      }
-      if (maxArea !== undefined) {
-        where.squareFootage.lte = maxArea;
-      }
-    }
-
-    if (ownerId) {
-      where.ownerId = ownerId;
-    }
-
-    const cacheKey = this.buildPropertyListCacheKey(normalizedQuery);
-
-    try {
-      return await this.cacheService.wrap(
-        cacheKey,
-        async () =>
-          this.monitorQuery('properties.findAll', { cacheKey, page, limit }, async () => {
-            const [properties, total] = await Promise.all([
-              (this.prisma as any).property.findMany({
-                where,
-                skip,
-                take: limit,
-                orderBy: { [sortBy]: sortOrder },
-                relationLoadStrategy: 'join',
-                include: {
-                  owner: { select: { id: true, email: true, role: true } },
-                },
-              }),
-              (this.prisma as any).property.count({ where }),
-            ]);
-
-            return {
-              properties,
-              total,
-              page,
-              limit,
-              totalPages: Math.ceil(total / limit),
-            };
-          }),
-        { l1Ttl: 60, l2Ttl: 300, tags: ['property', 'property:list'] },
-      );
-    } catch (error) {
-      this.logger.error('Failed to fetch properties', error);
-      throw new InvalidInputException(undefined, 'Failed to fetch properties');
-    }
-  }
-
-  async findOne(id: string) {
-    const cacheKey = `property:detail:${id}`;
-
-    try {
-      const property = await this.cacheService.wrap(
-        cacheKey,
-        async () =>
-          this.monitorQuery('properties.findOne', { propertyId: id }, async () =>
-            (this.prisma as any).property.findUnique({
-              where: { id },
-              relationLoadStrategy: 'join',
-              include: {
-                owner: { select: { id: true, email: true, role: true } },
-                documents: { select: { id: true, name: true, type: true, status: true, createdAt: true } },
-                valuations: { orderBy: { valuationDate: 'desc' }, take: 5 },
-              },
-            }),
-          ),
-        { l1Ttl: 60, l2Ttl: 300, tags: ['property', `property:${id}`] },
-      );
-
-      if (!property) {
-        throw new NotFoundException(`Property with ID ${id} not found`);
-      }
-
-      return property;
-    } catch (error) {
-      if (error instanceof NotFoundException) {
-        throw error;
-      }
-      this.logger.error(`Failed to fetch property ${id}`, error);
-      throw new InvalidInputException(undefined, 'Failed to fetch property');
-    }
-  }
-
-  async update(id: string, updatePropertyDto: UpdatePropertyDto) {
-    const input = await this.validateInput(UpdatePropertyDto, updatePropertyDto, 'update', {
-      skipMissingProperties: true,
+  async expireProperties(): Promise<{ updatedCount: number }> {
+    const now = new Date();
+    const result = await this.prisma.property.updateMany({
+      where: {
+        expiryDate: {
+          lt: now, // Less than now (expired)
+        },
+        status: {
+          notIn: [
+            PropertyStatus.SOLD,
+            PropertyStatus.RENTED,
+            PropertyStatus.ARCHIVED,
+            PropertyStatus.EXPIRED, // Already expired
+          ],
+        },
+      },
+      data: {
+        status: PropertyStatus.EXPIRED,
+      },
     });
 
-    try {
-      const existingProperty = await (this.prisma as any).property.findUnique({
-        where: { id },
+    if (result.count > 0) {
+      this.logger.log('Expired properties', {
+        event: 'properties.expired',
+        updatedCount: result.count,
       });
-
-      if (!existingProperty) {
-        throw new NotFoundException(`Property with ID ${id} not found`);
-      }
-
-      const updateData: any = {};
-
-      if (input.title !== undefined) {
-        updateData.title = input.title;
-      }
-      if (input.description !== undefined) {
-        updateData.description = input.description;
-      }
-      if (input.price !== undefined) {
-        updateData.price = input.price;
-      }
-      if (input.address) {
-        updateData.location = this.formatAddress(input.address);
-      }
-      if (input.status !== undefined) {
-        updateData.status = this.mapPropertyStatus(input.status);
-      }
-      if (input.bedrooms !== undefined) {
-        updateData.bedrooms = input.bedrooms;
-      }
-      if (input.bathrooms !== undefined) {
-        updateData.bathrooms = input.bathrooms;
-      }
-      if (input.areaSqFt !== undefined) {
-        updateData.squareFootage = input.areaSqFt;
-      }
-      if (input.type !== undefined) {
-        updateData.propertyType = input.type;
-      }
-
-      const property = await (this.prisma as any).property.update({
-        where: { id },
-        data: updateData,
-        relationLoadStrategy: 'join',
-        include: {
-          owner: { select: { id: true, email: true, role: true } },
-        },
-      });
-
-      await this.invalidatePropertyReadCaches(id);
-
-      this.logger.log(`Property updated: ${property.id}`);
-      return property;
-    } catch (error) {
-      if (error instanceof NotFoundException || error instanceof InvalidInputException) {
-        throw error;
-      }
-      this.logger.error(`Failed to update property ${id}`, error);
-      throw new InvalidInputException(undefined, 'Failed to update property');
     }
+
+    return { updatedCount: result.count };
   }
 
-  async remove(id: string): Promise<void> {
-    try {
-      const existingProperty = await (this.prisma as any).property.findUnique({
-        where: { id },
-      });
+  /**
+   * Transition a property's status according to the workflow state machine.
+   *
+   * Allowed happy path: DRAFT → PENDING → ACTIVE → UNDER_CONTRACT → SOLD.
+   * See `property-status.constants.ts` for the full transition map.
+   *
+   * Authorization: only the owner, an AGENT, or an ADMIN may transition.
+   *
+   * Throws:
+   * - NotFoundException if the property doesn't exist
+   * - ForbiddenException if the caller isn't allowed to mutate this property
+   * - BadRequestException if the transition isn't allowed by the workflow
+   */
+  async transitionStatus(
+    propertyId: string,
+    nextStatus: PropertyStatus,
+    actorId: string,
+    actorRole: UserRole | string,
+  ) {
+    const property = await this.prisma.property.findUnique({
+      where: { id: propertyId },
+      select: { id: true, ownerId: true, status: true },
+    });
 
-      if (!existingProperty) {
-        throw new NotFoundException(`Property with ID ${id} not found`);
-      }
-
-      await (this.prisma as any).property.delete({
-        where: { id },
-      });
-
-      await this.invalidatePropertyReadCaches(id);
-
-      this.logger.log(`Property deleted: ${id}`);
-    } catch (error) {
-      if (error instanceof NotFoundException) {
-        throw error;
-      }
-      this.logger.error(`Failed to delete property ${id}`, error);
-      throw new InvalidInputException(undefined, 'Failed to delete property');
+    if (!property) {
+      throw new NotFoundException(`Property ${propertyId} not found`);
     }
-  }
 
-  async searchNearby(latitude: number, longitude: number, _radiusKm: number = 10, query?: PropertyQueryDto) {
-    try {
-      const where: Record<string, any> = {
-        location: { contains: '', mode: 'insensitive' },
-      };
+    const isOwner = property.ownerId === actorId;
+    const isPrivileged = actorRole === UserRole.ADMIN || actorRole === UserRole.AGENT;
+    if (!isOwner && !isPrivileged) {
+      throw new ForbiddenException('You are not allowed to change the status of this property');
+    }
 
-      if (query?.search) {
-        where.OR = [
-          { title: { contains: query.search, mode: 'insensitive' } },
-          { description: { contains: query.search, mode: 'insensitive' } },
-        ];
-      }
+    const currentStatus = property.status as PropertyStatus;
 
-      if (query?.type) {
-        where.propertyType = query.type;
-      }
-      if (query?.status) {
-        where.status = this.mapPropertyStatus(query.status);
-      }
-      if (query?.minPrice !== undefined || query?.maxPrice !== undefined) {
-        where.price = {};
-        if (query.minPrice !== undefined) {
-          where.price.gte = query.minPrice;
-        }
-        if (query.maxPrice !== undefined) {
-          where.price.lte = query.maxPrice;
-        }
-      }
-      if (query?.minBedrooms !== undefined || query?.maxBedrooms !== undefined) {
-        where.bedrooms = {};
-        if (query.minBedrooms !== undefined) {
-          where.bedrooms.gte = query.minBedrooms;
-        }
-        if (query.maxBedrooms !== undefined) {
-          where.bedrooms.lte = query.maxBedrooms;
-        }
-      }
-      if (query?.minBathrooms !== undefined || query?.maxBathrooms !== undefined) {
-        where.bathrooms = {};
-        if (query.minBathrooms !== undefined) {
-          where.bathrooms.gte = query.minBathrooms;
-        }
-        if (query.maxBathrooms !== undefined) {
-          where.bathrooms.lte = query.maxBathrooms;
-        }
-      }
-      if (query?.minArea !== undefined || query?.maxArea !== undefined) {
-        where.squareFootage = {};
-        if (query.minArea !== undefined) {
-          where.squareFootage.gte = query.minArea;
-        }
-        if (query.maxArea !== undefined) {
-          where.squareFootage.lte = query.maxArea;
-        }
-      }
+    // Idempotent no-op: don't update, but echo the property back so callers
+    // can rely on a consistent shape.
+    if (currentStatus === nextStatus) {
+      this.logger.log('Property status unchanged', {
+        event: 'properties.status_transition_noop',
+        propertyId,
+        status: nextStatus,
+        actorId,
+      });
+      return this.findOne(propertyId);
+    }
 
-      const cacheKey = this.buildPropertyNearbyCacheKey(latitude, longitude, _radiusKm, query);
-
-      return await this.cacheService.wrap(
-        cacheKey,
-        async () =>
-          this.monitorQuery('properties.searchNearby', { cacheKey }, async () => {
-            const properties = await (this.prisma as any).property.findMany({
-              where,
-              relationLoadStrategy: 'join',
-              include: {
-                owner: { select: { id: true, email: true, role: true } },
-              },
-            });
-
-            return { properties, total: properties.length };
-          }),
-        { l1Ttl: 60, l2Ttl: 180, tags: ['property', 'property:nearby'] },
+    if (!canTransitionPropertyStatus(currentStatus, nextStatus)) {
+      const allowed = getAllowedNextPropertyStatuses(currentStatus).join(', ');
+      throw new BadRequestException(
+        `Cannot transition property from ${currentStatus} to ${nextStatus}. ` +
+          `Allowed next statuses: ${allowed || '(none)'}`,
       );
-    } catch (error) {
-      this.logger.error('Failed to search nearby properties', error);
-      throw new InvalidInputException(undefined, 'Failed to search nearby properties');
     }
+
+    await this.prisma.property.update({
+      where: { id: propertyId },
+      data: { status: nextStatus },
+    });
+
+    this.logger.log('Property status changed', {
+      event: 'properties.status_transitioned',
+      propertyId,
+      from: currentStatus,
+      to: nextStatus,
+      actorId,
+    });
+    // Drop the cached detail view first: the read below would otherwise serve the
+    // pre-transition status.
+    await this.invalidateCachedProperty(propertyId);
+
+    return this.findOne(propertyId);
   }
 
-  async updateStatus(id: string, newStatus: DTOPropertyStatus, userId?: string) {
-    try {
-      const property = await (this.prisma as any).property.findUnique({
-        where: { id },
-      });
+  /**
+   * Advanced property search with filters, pagination and sorting.
+   * Returns a paginated result so clients can render result counts and pages.
+   *
+   * Split into the two strategies it actually has. A trust-score range cannot
+   * be expressed as a SQL predicate, because the score is computed from five
+   * neighborhood columns, so it has to filter in memory; everything else pages
+   * in the database. Both branches plus the row annotation and the result
+   * shaping used to live in one 80-line method, which made the paging rules and
+   * the trust-score rules impossible to change independently.
+   */
+  async searchProperties(dto: SearchPropertiesDto): Promise<PaginatedPropertiesResult> {
+    // Served from Redis when the module is wired with PropertiesListingsCacheService.
+    if (this.listingsCache) {
+      return this.listingsCache.rememberSearch(dto, () => this.runSearch(dto));
+    }
+    return this.runSearch(dto);
+  }
 
-      if (!property) {
-        throw new NotFoundException(`Property with ID ${id} not found`);
-      }
+  /** The search query itself, uncached. */
+  private async runSearch(dto: SearchPropertiesDto): Promise<PaginatedPropertiesResult> {
+    const where = buildSearchWhereClause(dto);
+    const page = dto.page && dto.page > 0 ? dto.page : 1;
+    const limit = dto.limit && dto.limit > 0 ? dto.limit : 20;
+    const sort = { field: dto.sortBy ?? 'createdAt', order: dto.sortOrder ?? 'desc' } as {
+      field: string;
+      order: 'asc' | 'desc';
+    };
 
-      const currentStatus = property.status;
-      const targetStatus = this.mapPropertyStatus(newStatus);
+    return this.hasTrustScoreFilter(dto)
+      ? this.searchByTrustScore(dto, where, page, limit, sort)
+      : this.searchByPaging(dto, where, page, limit, sort);
+  }
 
-      if (!this.isValidStatusTransition(property.status, targetStatus)) {
-        throw new BusinessRuleViolationException(`Invalid status transition from ${currentStatus} to ${targetStatus}`);
-      }
+  private hasTrustScoreFilter(dto: SearchPropertiesDto): boolean {
+    return (
+      dto.minNeighborhoodTrustScore !== undefined || dto.maxNeighborhoodTrustScore !== undefined
+    );
+  }
+  /** Owner and neighborhood payload that every listing row is returned with. */
+  private get searchRelations() {
+    return {
+      owner: { select: { id: true, firstName: true, lastName: true, email: true } },
+      neighborhood: true,
+    };
+  }
 
-      const updatedProperty = await (this.prisma as any).property.update({
-        where: { id },
-        data: { status: targetStatus },
-        relationLoadStrategy: 'join',
-        include: {
-          owner: { select: { id: true, email: true, role: true } },
-        },
-      });
+  /** Attach the computed trust score to each row. No neighborhood scores null. */
+  private annotateTrustScore(rows: any[]): any[] {
+    return rows.map((p) => ({
+      ...p,
+      neighborhoodTrustScore: p.neighborhood
+        ? this.computeNeighborhoodTrustScore(p.neighborhood)
+        : null,
+    }));
+  }
 
-      await this.invalidatePropertyReadCaches(id);
+  /**
+   * A row without a neighborhood has no trust score, so it is excluded whenever
+   * either bound is set - including a bound the score would have satisfied,
+   * because "unknown" is not the same as "low".
+   */
+  private matchesTrustScoreRange(score: number | null, dto: SearchPropertiesDto): boolean {
+    if (
+      dto.minNeighborhoodTrustScore !== undefined &&
+      (score === null || score < dto.minNeighborhoodTrustScore)
+    ) {
+      return false;
+    }
+    if (
+      dto.maxNeighborhoodTrustScore !== undefined &&
+      (score === null || score > dto.maxNeighborhoodTrustScore)
+    ) {
+      return false;
+    }
+    return true;
+  }
 
-      this.logger.log(
-        `Property status updated: ${id} from ${currentStatus} to ${targetStatus}${userId ? ` by user ${userId}` : ''}`,
+  private buildPage<T>(
+    items: T[],
+    total: number,
+    page: number,
+    limit: number,
+  ): PaginatedPropertiesResult<T> {
+    return { items, total, page, limit, totalPages: limit > 0 ? Math.ceil(total / limit) : 0 };
+  }
+
+  /**
+   * Trust-score search: fetch every row matching the other filters, then filter
+   * and page in memory. `skip`/`take` cannot be pushed down here because the
+   * score is derived rather than stored.
+   */
+  private async searchByTrustScore(
+    dto: SearchPropertiesDto,
+    where: Record<string, unknown>,
+    page: number,
+    limit: number,
+    sort: { field: string; order: 'asc' | 'desc' },
+  ): Promise<PaginatedPropertiesResult> {
+    const allItems = await retryListingQuery(() =>
+      this.prisma.property.findMany({
+        where,
+        orderBy: { [sort.field]: sort.order },
+        include: this.searchRelations,
+      }),
+    );
+
+    const filtered = this.annotateTrustScore(allItems as any[]).filter((p) =>
+      this.matchesTrustScoreRange(p.neighborhoodTrustScore, dto),
+    );
+
+    const skip = (page - 1) * limit;
+    const items = filtered.slice(skip, skip + limit);
+
+    this.logger.log('Property search completed', {
+      event: 'properties.search',
+      page,
+      limit,
+      total: filtered.length,
+      returned: items.length,
+      filters: countSearchFilters(dto),
+      trustScoreFiltered: true,
+    });
+
+    return this.buildPage(items, filtered.length, page, limit);
+  }
+
+  /** The common case: page and count in one transaction so they cannot disagree. */
+  private async searchByPaging(
+    dto: SearchPropertiesDto,
+    where: Record<string, unknown>,
+    page: number,
+    limit: number,
+    sort: { field: string; order: 'asc' | 'desc' },
+  ): Promise<PaginatedPropertiesResult> {
+    const skip = (page - 1) * limit;
+
+    const [rawItems, total] = await retryListingQuery(() =>
+      this.prisma.$transaction([
+        this.prisma.property.findMany({
+          where,
+          skip,
+          take: limit,
+          orderBy: { [sort.field]: sort.order },
+          include: this.searchRelations,
+        }),
+        this.prisma.property.count({ where }),
+      ]),
+    );
+
+    const items = this.annotateTrustScore(rawItems as any[]);
+
+    this.logger.log('Property search completed', {
+      event: 'properties.search',
+      page,
+      limit,
+      total,
+      returned: items.length,
+      filters: countSearchFilters(dto),
+      trustScoreFiltered: false,
+    });
+
+    return this.buildPage(items, total, page, limit);
+  }
+
+  computeNeighborhoodTrustScore(neighborhood: any): number {
+    const scores: number[] = [];
+    if (neighborhood.walkScore != null) scores.push(neighborhood.walkScore);
+    if (neighborhood.transitScore != null) scores.push(neighborhood.transitScore);
+    if (neighborhood.bikeScore != null) scores.push(neighborhood.bikeScore);
+    if (neighborhood.schoolRating != null) scores.push(neighborhood.schoolRating * 10);
+    if (neighborhood.crimeIndex != null) scores.push(100 - neighborhood.crimeIndex);
+    if (scores.length === 0) return 50;
+    return Math.round(scores.reduce((a, b) => a + b, 0) / scores.length);
+  }
+
+  async approveProperty(propertyId: string, actorId: string) {
+    const property = await this.transitionStatus(
+      propertyId,
+      PropertyStatus.ACTIVE,
+      actorId,
+      UserRole.ADMIN,
+    );
+    this.logger.log('Property approved', {
+      event: 'properties.approved',
+      propertyId,
+      actorId,
+    });
+    return property;
+  }
+
+  async rejectProperty(propertyId: string, actorId: string) {
+    const property = await this.transitionStatus(
+      propertyId,
+      PropertyStatus.ARCHIVED,
+      actorId,
+      UserRole.ADMIN,
+    );
+    this.logger.log('Property rejected', {
+      event: 'properties.rejected',
+      propertyId,
+      actorId,
+    });
+    return property;
+  }
+
+  /** Statuses a bulk update is allowed to set. Anything else is rejected outright. */
+  private static readonly BULK_STATUSES: PropertyStatus[] = [
+    PropertyStatus.DRAFT,
+    PropertyStatus.ACTIVE,
+    PropertyStatus.ARCHIVED,
+  ];
+
+  async bulkUpdatePropertyStatus(
+    propertyIds: string[],
+    status: PropertyStatus,
+  ): Promise<{ updatedCount: number }> {
+    if (!propertyIds?.length) {
+      throw new BadRequestException('At least one property id is required');
+    }
+
+    // Previously any status that was not DRAFT or ARCHIVED was silently coerced
+    // to ACTIVE, so asking for SOLD quietly marked every listing ACTIVE. An
+    // unsupported status is now reported instead of applied.
+    if (!PropertiesService.BULK_STATUSES.includes(status)) {
+      throw new BadRequestException(
+        `Bulk status update only supports ${PropertiesService.BULK_STATUSES.join(', ')}`,
       );
-
-      return updatedProperty;
-    } catch (error) {
-      if (error instanceof NotFoundException || error instanceof BusinessRuleViolationException) {
-        throw error;
-      }
-      this.logger.error(`Failed to update property status ${id}`, error);
-      throw new InvalidInputException(undefined, 'Failed to update property status');
     }
+
+    const result = await this.prisma.property.updateMany({
+      where: { id: { in: propertyIds } },
+      data: { status },
+    });
+
+    this.logger.log('Bulk property status update', {
+      event: 'properties.bulk_status_updated',
+      requestedCount: propertyIds.length,
+      updatedCount: result.count,
+      status,
+    });
+
+    return { updatedCount: result.count };
   }
 
-  async findByOwner(ownerId: string, query?: PropertyQueryDto) {
-    try {
-      const ownerQuery = { ...query, ownerId };
-      const result = await this.findAll(ownerQuery);
-      return { properties: result.properties, total: result.total };
-    } catch (error) {
-      this.logger.error(`Failed to fetch properties for owner ${ownerId}`, error);
-      throw new InvalidInputException(undefined, 'Failed to fetch owner properties');
-    }
-  }
-
-  async getStatistics(): Promise<{
-    total: number;
-    byStatus: Record<string, number>;
-    byType: Record<string, number>;
-    averagePrice: number;
+  async bulkDeleteProperties(propertyIds: string[]): Promise<{
+    deletedCount: number;
+    propertyIds: string[];
   }> {
-    const cacheKey = 'property:stats';
-
-    try {
-      return await this.cacheService.wrap(
-        cacheKey,
-        async () =>
-          this.monitorQuery('properties.getStatistics', { cacheKey }, async () => {
-            const [total, avgPrice, statusResult, typeResult] = await Promise.all([
-              (this.prisma as any).property.count(),
-              (this.prisma as any).property.aggregate({ _avg: { price: true } }),
-              (this.prisma as any).property.groupBy({
-                by: ['status'],
-                _count: { id: true },
-              }),
-              (this.prisma as any).property.groupBy({
-                by: ['propertyType'],
-                _count: { id: true },
-              }),
-            ]);
-
-            const byStatus = (statusResult || []).reduce(
-              (acc: Record<string, number>, item: { status: string; _count: { id: number } | number }) => {
-                acc[item.status] = typeof item._count === 'number' ? item._count : item._count.id;
-                return acc;
-              },
-              {} as Record<string, number>,
-            );
-
-            const byType = (typeResult || []).reduce(
-              (acc: Record<string, number>, item: { propertyType: string; _count: { id: number } | number }) => {
-                acc[item.propertyType] = typeof item._count === 'number' ? item._count : item._count.id;
-                return acc;
-              },
-              {} as Record<string, number>,
-            );
-
-            return { total, byStatus, byType, averagePrice: Number(avgPrice._avg.price || 0) };
-          }),
-        { l1Ttl: 120, l2Ttl: 600, tags: ['property', 'property:stats'] },
-      );
-    } catch (error) {
-      this.logger.error('Failed to fetch property statistics', error);
-      throw new InvalidInputException(undefined, 'Failed to fetch property statistics');
+    if (!propertyIds?.length) {
+      throw new BadRequestException('At least one property id is required');
     }
-  }
 
-  private formatAddress(address: any): string {
-    const parts = [address.street, address.city, address.state, address.postalCode, address.country].filter(Boolean);
-    return parts.join(', ');
-  }
+    // Resolve the ids that actually exist first. Echoing the requested ids back
+    // told the caller everything had been deleted even when some ids matched
+    // nothing.
+    const existing = (await this.prisma.property.findMany({
+      where: { id: { in: propertyIds } },
+      select: { id: true },
+    })) as unknown as { id: string }[];
 
-  private mapPropertyStatus(status: DTOPropertyStatus): string {
-    const statusMap: Record<DTOPropertyStatus, string> = {
-      [DTOPropertyStatus.AVAILABLE]: 'LISTED',
-      [DTOPropertyStatus.PENDING]: 'PENDING',
-      [DTOPropertyStatus.SOLD]: 'SOLD',
-      [DTOPropertyStatus.RENTED]: 'SOLD',
-    };
-    return statusMap[status] || 'DRAFT';
-  }
+    const foundIds = existing.map((p) => p.id);
+    if (foundIds.length === 0) {
+      this.logger.warn('Bulk property delete matched nothing', {
+        event: 'properties.bulk_delete_no_match',
+        requestedCount: propertyIds.length,
+      });
+      return { deletedCount: 0, propertyIds: [] };
+    }
 
-  private isValidStatusTransition(currentStatus: string, targetStatus: string): boolean {
-    const validTransitions: Record<string, string[]> = {
-      DRAFT: ['DRAFT', 'PENDING', 'APPROVED'],
-      PENDING: ['PENDING', 'APPROVED', 'DRAFT'],
-      APPROVED: ['APPROVED', 'LISTED', 'DRAFT'],
-      LISTED: ['LISTED', 'SOLD', 'REMOVED'],
-      SOLD: ['SOLD'],
-      REMOVED: ['REMOVED', 'DRAFT'],
-    };
-    return validTransitions[currentStatus]?.includes(targetStatus) || false;
-  }
-
-  private async monitorQuery<T>(
-    operation: string,
-    metadata: Record<string, unknown>,
-    query: () => Promise<T>,
-  ): Promise<T> {
-    const startedAt = Date.now();
-
+    let result: { count: number };
     try {
-      const result = await query();
-      const duration = Date.now() - startedAt;
-      const slowThreshold = this.configService.get<number>('SLOW_QUERY_THRESHOLD', 500);
-
-      if (duration >= slowThreshold) {
-        this.logger.warn(`Slow query detected for ${operation}: ${duration}ms ${JSON.stringify(metadata)}`);
-      } else {
-        this.logger.debug(`Query completed for ${operation}: ${duration}ms`);
+      result = await this.prisma.property.deleteMany({ where: { id: { in: foundIds } } });
+    } catch (err) {
+      // A listing referenced by a transaction, document or commission cannot be
+      // removed. That is a client-correctable conflict, not a server fault, and
+      // the raw Prisma error must not reach the client.
+      const code = (err as { code?: string })?.code;
+      if (code === 'P2003' || code === 'P2014') {
+        this.logger.warn('Bulk property delete blocked by a foreign key', {
+          event: 'properties.bulk_delete_conflict',
+          requestedCount: foundIds.length,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        throw new ConflictException(
+          'One or more properties are referenced by transactions or documents and cannot be deleted',
+        );
       }
-
-      return result;
-    } catch (error) {
-      const duration = Date.now() - startedAt;
-      this.logger.error(`Query failed for ${operation} after ${duration}ms`, error instanceof Error ? error.stack : '');
-      throw error;
-    }
-  }
-
-  private buildPropertyListCacheKey(query?: PropertyQueryDto): string {
-    return `property:list:${this.serializeCacheInput(query || {})}`;
-  }
-
-  private buildPropertyNearbyCacheKey(
-    latitude: number,
-    longitude: number,
-    radiusKm: number,
-    query?: PropertyQueryDto,
-  ): string {
-    return `property:nearby:${latitude}:${longitude}:${radiusKm}:${this.serializeCacheInput(query || {})}`;
-  }
-
-  private serializeCacheInput(input: PropertyQueryDto | Record<string, unknown>): string {
-    return Object.entries(input)
-      .filter(([, value]) => value !== undefined && value !== null)
-      .sort(([left], [right]) => left.localeCompare(right))
-      .map(([key, value]) => `${key}=${Array.isArray(value) ? value.join(',') : String(value)}`)
-      .join('|');
-  }
-
-  private async invalidatePropertyReadCaches(propertyId?: string): Promise<void> {
-    const invalidations: Promise<unknown>[] = [
-      this.cacheService.invalidateByPattern('property:list:*'),
-      this.cacheService.invalidateByPattern('property:nearby:*'),
-      this.cacheService.del('property:stats'),
-    ];
-
-    if (propertyId) {
-      invalidations.push(this.cacheService.del(`property:detail:${propertyId}`));
+      throw err;
     }
 
-    await Promise.all(invalidations);
+    this.logger.warn('Bulk properties deleted', {
+      event: 'properties.bulk_deleted',
+      requestedCount: propertyIds.length,
+      deletedCount: result.count,
+      actor: 'admin',
+    });
+
+    return {
+      deletedCount: result.count,
+      propertyIds: foundIds,
+    };
+  }
+
+  async bulkExportProperties(
+    propertyIds: string[],
+    filter?: string,
+  ): Promise<{ total: number; data: Record<string, any>[] }> {
+    const propertyWhere: Record<string, unknown> = { id: { in: propertyIds } };
+
+    if (filter) {
+      propertyWhere.title = { contains: filter, mode: 'insensitive' as const };
+    }
+
+    const properties = await (this.prisma.property as any).findMany({
+      where: propertyWhere,
+      select: {
+        id: true,
+        title: true,
+        address: true,
+        city: true,
+        state: true,
+        zipCode: true,
+        price: true,
+        propertyType: true,
+        bedrooms: true,
+        bathrooms: true,
+        squareFeet: true,
+        lotSize: true,
+        yearBuilt: true,
+        hoaName: true,
+        hoaMonthlyFee: true,
+        hoaAmenities: true,
+        hoaContactInfo: true,
+        status: true,
+        createdAt: true,
+        updatedAt: true,
+        ownerId: true,
+        owner: {
+          select: {
+            id: true,
+            email: true,
+            firstName: true,
+            lastName: true,
+            phone: true,
+          },
+        },
+        agents: {
+          include: {
+            agent: {
+              select: {
+                id: true,
+                firstName: true,
+                lastName: true,
+                email: true,
+                phone: true,
+              },
+            },
+          },
+        },
+      },
+    });
+
+    this.logger.log('Bulk property export', {
+      event: 'properties.bulk_exported',
+      requestedCount: propertyIds.length,
+      matchedCount: properties.length,
+      filtered: Boolean(filter),
+    });
+
+    const exportData: Record<string, any>[] = properties.map((prop: Record<string, any>) => ({
+      id: prop.id,
+      title: prop.title,
+      address: prop.address,
+      city: prop.city,
+      state: prop.state,
+      zipCode: prop.zipCode,
+      price: Number(prop.price),
+      propertyType: prop.propertyType,
+      bedrooms: prop.bedrooms,
+      bathrooms: prop.bathrooms,
+      squareFeet: prop.squareFeet,
+      lotSize: prop.lotSize,
+      yearBuilt: prop.yearBuilt,
+      hoaName: prop.hoaName,
+      hoaMonthlyFee:
+        prop.hoaMonthlyFee === null || prop.hoaMonthlyFee === undefined
+          ? prop.hoaMonthlyFee
+          : Number(prop.hoaMonthlyFee),
+      hoaAmenities: prop.hoaAmenities,
+      hoaContactInfo: prop.hoaContactInfo,
+      status: prop.status,
+      ownerId: prop.ownerId,
+      ownerEmail: prop.owner.email,
+      ownerName: `${prop.owner.firstName} ${prop.owner.lastName}`,
+      ownerPhone: prop.owner.phone,
+      agents: (prop.agents || []).map((pa: any) => ({
+        agentId: pa.agentId,
+        name: `${pa.agent.firstName} ${pa.agent.lastName}`,
+        email: pa.contactEmail || pa.agent.email,
+        phone: pa.contactPhone || pa.agent.phone,
+        commissionRate: Number(pa.commissionRate),
+      })),
+      createdAt: prop.createdAt,
+      updatedAt: prop.updatedAt,
+    }));
+
+    return {
+      total: exportData.length,
+      data: exportData,
+    };
+  }
+
+  async assignAgent(propertyId: string, dto: AssignAgentDto, user: AuthUserPayload) {
+    const property = await this.prisma.property.findUnique({
+      where: { id: propertyId },
+    });
+    if (!property) {
+      throw new NotFoundException('Property not found');
+    }
+
+    if (user.role !== 'ADMIN' && property.ownerId !== user.sub) {
+      throw new ForbiddenException('Only the property owner or an admin can assign agents');
+    }
+
+    const agent = await this.prisma.user.findUnique({
+      where: { id: dto.agentId },
+    });
+    if (!agent) {
+      throw new NotFoundException('Agent user not found');
+    }
+    if (agent.role !== 'AGENT') {
+      throw new BadRequestException('Assigned user must have the AGENT role');
+    }
+
+    const existing = await this.prisma.propertyAgent.findUnique({
+      where: {
+        propertyId_agentId: {
+          propertyId,
+          agentId: dto.agentId,
+        },
+      },
+    });
+    if (existing) {
+      throw new BadRequestException('Agent is already assigned to this property');
+    }
+
+    await this.invalidateCachedProperty(propertyId);
+
+    const assignment = await this.prisma.propertyAgent.create({
+      data: {
+        propertyId,
+        agentId: dto.agentId,
+        commissionRate:
+          dto.commissionRate !== undefined
+            ? new Decimal(dto.commissionRate.toString())
+            : new Decimal('0.03'),
+        contactPhone: dto.contactPhone ?? null,
+        contactEmail: dto.contactEmail ?? null,
+      },
+      include: {
+        agent: {
+          select: {
+            id: true,
+            firstName: true,
+            lastName: true,
+            email: true,
+            phone: true,
+          },
+        },
+      },
+    });
+
+    this.logger.log('Agent assigned to property', {
+      event: 'properties.agent_assigned',
+      propertyId,
+      agentId: dto.agentId,
+      actorId: user.sub,
+    });
+
+    return assignment;
+  }
+
+  async updateAgentAssignment(
+    propertyId: string,
+    agentId: string,
+    dto: UpdateAgentAssignmentDto,
+    user: AuthUserPayload,
+  ) {
+    const property = await this.prisma.property.findUnique({
+      where: { id: propertyId },
+    });
+    if (!property) {
+      throw new NotFoundException('Property not found');
+    }
+
+    if (user.role !== 'ADMIN' && property.ownerId !== user.sub) {
+      throw new ForbiddenException(
+        'Only the property owner or an admin can update agent assignments',
+      );
+    }
+
+    const assignment = await this.prisma.propertyAgent.findUnique({
+      where: {
+        propertyId_agentId: {
+          propertyId,
+          agentId,
+        },
+      },
+    });
+    if (!assignment) {
+      throw new NotFoundException('Agent assignment not found for this property');
+    }
+
+    await this.invalidateCachedProperty(propertyId);
+
+    const updatedAssignment = await this.prisma.propertyAgent.update({
+      where: {
+        propertyId_agentId: {
+          propertyId,
+          agentId,
+        },
+      },
+      data: {
+        commissionRate:
+          dto.commissionRate !== undefined ? new Decimal(dto.commissionRate.toString()) : undefined,
+        contactPhone: dto.contactPhone !== undefined ? dto.contactPhone : undefined,
+        contactEmail: dto.contactEmail !== undefined ? dto.contactEmail : undefined,
+      },
+      include: {
+        agent: {
+          select: {
+            id: true,
+            firstName: true,
+            lastName: true,
+            email: true,
+            phone: true,
+          },
+        },
+      },
+    });
+
+    this.logger.log('Agent assignment updated', {
+      event: 'properties.agent_assignment_updated',
+      propertyId,
+      agentId,
+      actorId: user.sub,
+    });
+
+    return updatedAssignment;
+  }
+
+  async removeAgentAssignment(propertyId: string, agentId: string, user: AuthUserPayload) {
+    const property = await this.prisma.property.findUnique({
+      where: { id: propertyId },
+    });
+    if (!property) {
+      throw new NotFoundException('Property not found');
+    }
+
+    if (user.role !== 'ADMIN' && property.ownerId !== user.sub) {
+      throw new ForbiddenException(
+        'Only the property owner or an admin can remove agent assignments',
+      );
+    }
+
+    const assignment = await this.prisma.propertyAgent.findUnique({
+      where: {
+        propertyId_agentId: {
+          propertyId,
+          agentId,
+        },
+      },
+    });
+    if (!assignment) {
+      throw new NotFoundException('Agent assignment not found for this property');
+    }
+
+    await this.invalidateCachedProperty(propertyId);
+
+    const removed = await this.prisma.propertyAgent.delete({
+      where: {
+        propertyId_agentId: {
+          propertyId,
+          agentId,
+        },
+      },
+    });
+
+    this.logger.log('Agent removed from property', {
+      event: 'properties.agent_assignment_removed',
+      propertyId,
+      agentId,
+      actorId: user.sub,
+    });
+
+    return removed;
+  }
+
+  async getAgents(propertyId: string) {
+    const property = await this.prisma.property.findUnique({
+      where: { id: propertyId },
+    });
+    if (!property) {
+      throw new NotFoundException('Property not found');
+    }
+
+    const assignments = await this.prisma.propertyAgent.findMany({
+      where: { propertyId },
+      include: {
+        agent: {
+          select: {
+            id: true,
+            firstName: true,
+            lastName: true,
+            email: true,
+            phone: true,
+          },
+        },
+      },
+    });
+
+    return assignments.map((pa: any) => ({
+      id: pa.id,
+      propertyId: pa.propertyId,
+      agentId: pa.agentId,
+      commissionRate: Number(pa.commissionRate),
+      contactPhone: pa.contactPhone || pa.agent.phone,
+      contactEmail: pa.contactEmail || pa.agent.email,
+      createdAt: pa.createdAt,
+      updatedAt: pa.updatedAt,
+      agent: pa.agent,
+    }));
+  }
+
+  // ---- Amenity methods (#551) ----
+
+  async addAmenity(propertyId: string, dto: CreateAmenityDto) {
+    const property = await this.prisma.property.findUnique({ where: { id: propertyId } });
+    if (!property) {
+      throw new NotFoundException('Property not found');
+    }
+    await this.invalidateCachedProperty(propertyId);
+
+    const amenity = await this.prisma.propertyAmenity.create({
+      data: {
+        propertyId,
+        name: dto.name,
+        amenityType: dto.amenityType,
+        description: dto.description ?? null,
+        isAvailable: dto.isAvailable ?? true,
+      },
+    });
+
+    this.logger.log('Amenity added to property', {
+      event: 'properties.amenity_added',
+      propertyId,
+      amenityId: amenity.id,
+      amenityType: dto.amenityType,
+    });
+
+    return amenity;
+  }
+
+  async getAmenities(propertyId: string) {
+    const property = await this.prisma.property.findUnique({ where: { id: propertyId } });
+    if (!property) {
+      throw new NotFoundException('Property not found');
+    }
+    return this.prisma.propertyAmenity.findMany({
+      where: { propertyId },
+      orderBy: { createdAt: 'asc' },
+    });
+  }
+
+  async updateAmenity(propertyId: string, amenityId: string, dto: UpdateAmenityDto) {
+    const amenity = await this.prisma.propertyAmenity.findUnique({
+      where: { id: amenityId },
+    });
+    if (!amenity || amenity.propertyId !== propertyId) {
+      throw new NotFoundException('Amenity not found for this property');
+    }
+    await this.invalidateCachedProperty(propertyId);
+
+    const updatedAmenity = await this.prisma.propertyAmenity.update({
+      where: { id: amenityId },
+      data: {
+        name: dto.name,
+        amenityType: dto.amenityType,
+        description: dto.description,
+        isAvailable: dto.isAvailable,
+      },
+    });
+
+    this.logger.log('Property amenity updated', {
+      event: 'properties.amenity_updated',
+      propertyId,
+      amenityId,
+    });
+
+    return updatedAmenity;
+  }
+
+  async removeAmenity(propertyId: string, amenityId: string) {
+    const amenity = await this.prisma.propertyAmenity.findUnique({
+      where: { id: amenityId },
+    });
+    if (!amenity || amenity.propertyId !== propertyId) {
+      throw new NotFoundException('Amenity not found for this property');
+    }
+    await this.invalidateCachedProperty(propertyId);
+
+    const removed = await this.prisma.propertyAmenity.delete({ where: { id: amenityId } });
+
+    this.logger.log('Amenity removed from property', {
+      event: 'properties.amenity_removed',
+      propertyId,
+      amenityId,
+    });
+
+    return removed;
   }
 }

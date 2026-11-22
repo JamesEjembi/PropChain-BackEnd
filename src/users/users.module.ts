@@ -1,23 +1,57 @@
-import { Module, forwardRef } from '@nestjs/common';
-import { UserService } from './user.service';
-import { UserController } from './user.controller';
-import { AuthModule } from '../auth/auth.module';
-import { PasswordValidator } from '../common/validators/password.validator';
-import { PasswordRotationService } from '../common/services/password-rotation.service';
-import { PrismaModule } from '../database/prisma/prisma.module';
-import { CacheModule } from '../common/cache/cache.module';
-import { BoundaryValidationModule } from '../common/validation';
+import { Module } from '@nestjs/common';
+import { UsersService } from './users.service';
+import { UsersController } from './users.controller';
+import { UserPreferencesService } from './user-preferences.service';
+import { UserPreferencesController } from './user-preferences.controller';
+import { ActivityLogService } from './activity-log.service';
+import { ActivityLogController, AdminActivityLogController } from './activity-log.controller';
+import { PrismaModule } from '../database/prisma.module';
+import { SessionsModule } from '../sessions/sessions.module';
+
+import { EmailVerificationController } from './email-verification.controller';
+import { EmailVerificationService } from './email-verification.service';
+import { EmailService } from '../email/email.service';
+import { RateLimitService } from '../auth/rate-limit.service';
+
+import { AccountDeletionService } from './account-deletion.service';
+import { DataExportService } from './data-export.service';
+import { I18nModule } from '../i18n/i18n.module';
+import { UserImportController } from './user-import.controller';
+import { UserImportService } from './user-import.service';
+import { UsersHealthController } from './users-health.controller';
+import { UsersHealthIndicator } from './users-health.indicator';
 
 @Module({
-  imports: [
-    // FIX: Using forwardRef to allow AuthModule and UsersModule to depend on each other
-    forwardRef(() => AuthModule),
-    PrismaModule,
-    CacheModule,
-    BoundaryValidationModule,
+  imports: [PrismaModule, SessionsModule, I18nModule],
+  controllers: [
+    // Before UsersController: `GET /users/health` must not match `GET /users/:id`.
+    UsersHealthController,
+    UsersController,
+    UserPreferencesController,
+    ActivityLogController,
+    AdminActivityLogController,
+    EmailVerificationController,
+    UserImportController,
   ],
-  controllers: [UserController],
-  providers: [UserService, PasswordValidator, PasswordRotationService],
-  exports: [UserService, PasswordRotationService], // Export for use in other modules
+  providers: [
+    UsersService,
+    UsersHealthIndicator,
+    UserPreferencesService,
+    ActivityLogService,
+    EmailVerificationService,
+    EmailService,
+    RateLimitService,
+    AccountDeletionService,
+    DataExportService,
+    UserImportService,
+  ],
+  exports: [
+    UsersService,
+    UserPreferencesService,
+    ActivityLogService,
+    EmailVerificationService,
+    AccountDeletionService,
+    DataExportService,
+  ],
 })
 export class UsersModule {}

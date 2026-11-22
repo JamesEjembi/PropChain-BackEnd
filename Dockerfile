@@ -1,55 +1,50 @@
-# Multi-stage build for production optimization
-FROM node:18-alpine AS base
+# PropChain Backend – production Docker image (#1175)
+#
+# Multi-stage build:
+#   1. builder  – installs dependencies, generates the Prisma client, builds dist
+#   2. runtime  – slim Node 20 alpine image, non-root user, runs `node dist/main`
+#
+# Migrations run via docker-entrypoint.sh before the app starts.
 
-# Install dependencies only when needed
-FROM base AS deps
-RUN apk add --no-cache libc6-compat postgresql-client bash
+# ---------- Build stage ----------
+FROM node:20-alpine AS builder
+
 WORKDIR /app
 
-# Install dependencies based on the preferred package manager
-COPY package.json package-lock.json* ./
-RUN npm ci --only=production
+# Install dependencies first to leverage Docker layer caching.
+COPY package.json package-lock.json ./
+RUN npm ci
 
-# Rebuild the source code only when needed
-FROM base AS builder
-WORKDIR /app
-COPY --from=deps /app/node_modules ./node_modules
+# The Prisma client needs the schema before it can be generated.
+COPY prisma ./prisma
+RUN npx prisma generate
+
+# Copy the rest of the source and build the production bundle.
 COPY . .
+RUN npm run build && chmod +x docker-entrypoint.sh
 
-# Build the application
-RUN npm run build
-
-# Production image, copy all the files and run the app
-FROM base AS runner
-WORKDIR /app
+# ---------- Runtime stage ----------
+FROM node:20-alpine AS runtime
 
 ENV NODE_ENV=production
+WORKDIR /app
 
-# Create a non-root user
-RUN addgroup --system --gid 1001 nodejs
-RUN adduser --system --uid 1001 nestjs
+# Run as a non-root user for security.
+RUN addgroup -g 1001 -S nodejs \
+    && adduser -S nodejs -u 1001 -G nodejs
 
-# Copy the built application
-COPY --from=builder --chown=nestjs:nodejs /app/dist ./dist
-COPY --from=builder --chown=nestjs:nodejs /app/node_modules ./node_modules
-COPY --from=builder --chown=nestjs:nodejs /app/package.json ./package.json
+COPY --from=builder --chown=nodejs:nodejs /app/node_modules ./node_modules
+COPY --from=builder --chown=nodejs:nodejs /app/dist ./dist
+COPY --from=builder --chown=nodejs:nodejs /app/prisma ./prisma
+COPY --from=builder --chown=nodejs:nodejs /app/package.json ./package.json
+COPY --from=builder --chown=nodejs:nodejs /app/docker-entrypoint.sh ./docker-entrypoint.sh
 
-# Copy scripts for backups
-COPY --from=builder --chown=nestjs:nodejs /app/scripts ./scripts
-RUN chmod +x scripts/*.sh
+USER nodejs
 
-# Create logs directory
-RUN mkdir -p logs && chown nestjs:nodejs logs
-
-# Switch to non-root user
-USER nestjs
-
-# Expose port
 EXPOSE 3000
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-  CMD curl -f http://localhost:3000/api/health || exit 1
+# Liveness probe – GET /healthz returns 200 while the process is running.
+HEALTHCHECK --interval=30s --timeout=3s --start-period=20s --retries=3 \
+  CMD node -e "fetch('http://127.0.0.1:3000/healthz').then((r) => (r.ok ? process.exit(0) : process.exit(1))).catch(() => process.exit(1))"
 
-# Start the application
-CMD ["npm", "start"]
+ENTRYPOINT ["./docker-entrypoint.sh"]

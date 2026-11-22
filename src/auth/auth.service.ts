@@ -1,644 +1,2019 @@
-import { Injectable } from '@nestjs/common';
 import {
+  BadRequestException,
+  Injectable,
+  NotFoundException,
+  Optional,
+  ServiceUnavailableException,
   UnauthorizedException,
-  InvalidCredentialsException,
-  TokenExpiredException,
-  InvalidInputException,
-  UserNotFoundException,
-} from '../common/errors/custom.exceptions';
-import { UserService } from '../users/user.service';
-import { JwtService } from '@nestjs/jwt';
+} from '@nestjs/common';
+import { AppLogger } from '../common/logger';
+import { AuthCacheService, AUTH_DASHBOARD_TTL_SECONDS } from './auth-cache.service';
+import { retryWithBackoff, TransientError } from './retry.util';
+import {
+  AUTH_DEFAULT_PAGE_SIZE,
+  AuthPaginationQueryDto,
+  buildPageMeta,
+} from './dto/pagination-query.dto';
 import { ConfigService } from '@nestjs/config';
-import { CreateUserDto } from '../users/dto/create-user.dto';
-import * as bcrypt from 'bcrypt';
-import { RedisService } from '../common/services/redis.service';
-import { v4 as uuidv4 } from 'uuid';
-import { StructuredLoggerService } from '../common/logging/logger.service';
-import { JwtPayload, SessionInfo } from './auth.types';
-import { JWT_TOKEN_USE, tokenRevocationRedisKeys } from './constants';
-import { createHash } from 'crypto';
+import { Prisma, BlacklistedToken, Document, ApiKey } from '@prisma/client';
+import { randomUUID } from 'crypto';
+import * as jwt from 'jsonwebtoken';
+import { PrismaService } from '../database/prisma.service';
+import { UsersService } from '../users/users.service';
+import { SessionsService } from '../sessions/sessions.service';
+import { EmailService } from '../email/email.service';
+import {
+  ChangePasswordDto,
+  CreateApiKeyDto,
+  LoginDto,
+  RefreshTokenDto,
+  RegisterDto,
+  RequestPasswordResetDto,
+  ResetPasswordDto,
+  UpdateApiKeyPermissionsDto,
+  VerifyTwoFactorDto,
+} from './dto/auth.dto';
+import { TwoFactorService } from './two-factor.service';
+import {
+  buildOtpAuthUrl,
+  buildQrCodeUrl,
+  comparePassword,
+  createSha256,
+  generateBackupCodes,
+  hashPassword,
+  parseDuration,
+  randomBase32Secret,
+  randomToken,
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  redactEmail,
+  sanitizeUser,
+  verifyBackupCode,
+  verifyTotpCode,
+} from './security.utils';
+import { validatePassword } from './password.utils';
+import { AuthUserPayload } from './types/auth-user.type';
+import { GoogleProfile } from './strategies/google.strategy';
 
-/**
- * Auth Service
- *
- * Handles all authentication operations including:
- * - User registration and email verification
- * - Email/Password and Web3 wallet login
- * - JWT Token generation and rotation
- * - Session management and invalidation
- *
- * @class AuthService
- */
+import { LoginRateLimitService } from './login-rate-limit.service';
+import { UserRole, UserTier } from '../types/prisma.types';
+import { FraudService } from '../fraud/fraud.service';
+import { ApiKeyAnalyticsService } from './api-key-analytics.service';
+import { userRegistrationsTotal, userLoginsTotal } from '../metrics/metrics.controller';
+
+const MIN_JWT_SECRET_LENGTH = 32;
+
+type JwtPayload = {
+  sub: string;
+  email: string;
+  role: UserRole;
+  tier: UserTier;
+  type: 'access' | 'refresh';
+  jti: string;
+  family?: string;
+  exp?: number;
+};
+
+type TransactionWithPropertyTitle = Prisma.TransactionGetPayload<{
+  include: { property: { select: { title: true } } };
+}>;
+
+type PropertyWithOwnerName = Prisma.PropertyGetPayload<{
+  include: { owner: { select: { firstName: true; lastName: true } } };
+}>;
+
+interface RecaptchaVerifyResponse {
+  success: boolean;
+  score?: number;
+  action?: string;
+  challenge_ts?: string;
+  hostname?: string;
+  'error-codes'?: string[];
+}
+
 @Injectable()
 export class AuthService {
+  private readonly logger = new AppLogger(AuthService.name);
+  private readonly issuer = 'PropChain';
+
+  private readonly registrationIpMap = new Map<string, { email: string; expiresAt: Date }>();
+
+  private hashEmail(email: string): string {
+    const debugPii = this.configService.get<string>('DEBUG_PII') === 'true';
+    if (debugPii) {
+      return email;
+    }
+    return createSha256(email).slice(0, 12);
+  }
+
+  private readonly accessTokenTtlSeconds: number;
+  private readonly refreshTokenTtlSeconds: number;
+  private readonly jwtSecret: string;
+  private readonly jwtRefreshSecret: string;
+  private readonly bcryptRounds: number;
+
   constructor(
-    private readonly userService: UserService,
-    private readonly jwtService: JwtService,
+    private readonly prisma: PrismaService,
+    private readonly usersService: UsersService,
+    private readonly sessionsService: SessionsService,
     private readonly configService: ConfigService,
-    private readonly redisService: RedisService,
-    private readonly logger: StructuredLoggerService,
+    private readonly emailService: EmailService,
+    private readonly rateLimitService: LoginRateLimitService,
+    private readonly fraudService: FraudService,
+    @Optional() private readonly apiKeyAnalyticsService?: ApiKeyAnalyticsService,
+    @Optional() private readonly twoFactorService?: TwoFactorService,
+    @Optional() private readonly authCache?: AuthCacheService,
   ) {
-    this.logger.setContext('AuthService');
-  }
-
-  /**
-   * Register a new user and send verification email
-   *
-   * @param {CreateUserDto} createUserDto - The user registration data
-   * @returns {Promise<{message: string}>} Success message
-   *
-   * @example
-   * ```typescript
-   * const result = await authService.register({
-   *   email: 'dev@propchain.com',
-   *   password: 'Password123!',
-   *   firstName: 'Prop',
-   *   lastName: 'Chain'
-   * });
-   * ```
-   */
-  async register(createUserDto: CreateUserDto) {
-    try {
-      const user = await this.userService.create(createUserDto);
-      await this.sendVerificationEmail(user.id, user.email);
-      this.logger.logAuth('User registration successful', { userId: user.id });
-      return {
-        message: 'User registered successfully. Please check your email for verification.',
-      };
-    } catch (error: unknown) {
-      const errorMessage = error instanceof Error ? error.message : 'Unknown error occurred';
-      this.logger.error('User registration failed', errorMessage, {
-        email: createUserDto.email,
-      });
-      throw error;
+    const jwtSecret = this.configService.get<string>('JWT_SECRET');
+    if (!jwtSecret || jwtSecret.length < MIN_JWT_SECRET_LENGTH) {
+      throw new Error(
+        `JWT_SECRET must be set and at least ${MIN_JWT_SECRET_LENGTH} characters (256 bits) long`,
+      );
     }
-  }
+    this.jwtSecret = jwtSecret;
 
-  /**
-   * Authenticate a user and generate JWT tokens
-   *
-   * Supports both email/password and Web3 wallet address/signature.
-   * Implements login attempt tracking for brute-force protection.
-   *
-   * @param {Object} credentials - The credentials to authenticate
-   * @param {Object} [requestMeta] - Request metadata for session fingerprinting
-   * @returns {Promise<AuthResponse>} The generated tokens and user info
-   *
-   * @example
-   * ```typescript
-   * // Email login
-   * const auth = await authService.login({
-   *   email: 'dev@propchain.com',
-   *   password: 'Password123!'
-   * });
-   *
-   * // Web3 login
-   * const auth = await authService.login({
-   *   walletAddress: '0x123...',
-   *   signature: '0xabc...'
-   * });
-   * ```
-   */
-  async login(
-    credentials: { email?: string; password?: string; walletAddress?: string; signature?: string },
-    requestMeta?: { ip?: string; userAgent?: string },
-  ) {
-    let user: any;
-
-    // brute force protection
-    const identifier = credentials.email || credentials.walletAddress;
-    const maxAttempts = this.configService.get<number>('MAX_LOGIN_ATTEMPTS', 5);
-    const attemptWindow = this.configService.get<number>('LOGIN_ATTEMPT_WINDOW', 600); // seconds
-    const attemptsKey = identifier ? `login_attempts:${identifier}` : null;
-
-    if (attemptsKey) {
-      const existing = await this.redisService.get(attemptsKey);
-      const attempts = parseInt(existing || '0', 10);
-      if (attempts >= maxAttempts) {
-        this.logger.warn('Too many login attempts', { identifier });
-        throw new UnauthorizedException('Too many login attempts. Please try again later.');
-      }
+    const jwtRefreshSecret = this.configService.get<string>('JWT_REFRESH_SECRET');
+    if (!jwtRefreshSecret || jwtRefreshSecret.length < MIN_JWT_SECRET_LENGTH) {
+      throw new Error(
+        `JWT_REFRESH_SECRET must be set and at least ${MIN_JWT_SECRET_LENGTH} characters (256 bits) long`,
+      );
     }
-
-    try {
-      if (credentials.email && credentials.password) {
-        user = await this.validateUserByEmail(credentials.email, credentials.password);
-      } else if (credentials.walletAddress) {
-        user = await this.validateUserByWallet(credentials.walletAddress, credentials.signature);
-      } else {
-        throw new InvalidInputException(undefined, 'Email/password or wallet address/signature required');
-      }
-
-      if (!user) {
-        this.logger.warn('Invalid login attempt', { email: credentials.email });
-        // increment attempt count only for email-based logins
-        if (attemptsKey) {
-          const existing = await this.redisService.get(attemptsKey);
-          const attempts = parseInt(existing || '0', 10) + 1;
-          await this.redisService.setex(attemptsKey, attemptWindow, attempts.toString());
-        }
-        throw new InvalidCredentialsException();
-      }
-
-      // successful login, clear attempts
-      if (attemptsKey) {
-        await this.redisService.del(attemptsKey);
-      }
-
-      this.logger.logAuth('User login successful', { userId: user.id });
-      return this.generateTokens(user, requestMeta);
-    } catch (error: unknown) {
-      const errorMessage = error instanceof Error ? error.message : 'Unknown error occurred';
-      this.logger.error('User login failed', errorMessage, {
-        email: credentials.email,
-      });
-      throw error;
-    }
-  }
-
-  async validateUserByEmail(email: string, password: string): Promise<any> {
-    const user = await this.userService.findByEmail(email);
-
-    if (!user || !user.password) {
-      this.logger.warn('Email validation failed: User not found', { email });
-      throw new InvalidCredentialsException();
-    }
-
-    const isPasswordValid = await bcrypt.compare(password, user.password as string);
-    if (!isPasswordValid) {
-      this.logger.warn('Email validation failed: Invalid password', { email });
-      throw new InvalidCredentialsException();
-    }
-
-    const { password: _, ...result } = user as any;
-    return result;
-  }
-
-  async validateUserByWallet(walletAddress: string, signature?: string): Promise<any> {
-    let user = await this.userService.findByWalletAddress(walletAddress);
-
-    if (!user) {
-      user = await this.userService.create({
-        email: `${walletAddress}@wallet.auth`,
-        password: Math.random().toString(36).slice(-10),
-        walletAddress,
-        firstName: 'Web3',
-        lastName: 'User',
-      });
-      this.logger.logAuth('New Web3 user created', { walletAddress });
-    }
-
-    const { password: _, ...result } = user as any;
-    return result;
-  }
-
-  async refreshToken(refreshToken: string, requestMeta?: { ip?: string; userAgent?: string }) {
-    try {
-      const payload = (await this.jwtService.verifyAsync(refreshToken, {
-        secret: this.configService.get<string>('JWT_REFRESH_SECRET'),
-      })) as JwtPayload;
-
-      if (payload.tokenUse !== JWT_TOKEN_USE.REFRESH || !payload.rid) {
-        this.logger.warn('Refresh token validation failed: wrong token type', { userId: payload.sub });
-        throw new TokenExpiredException('Invalid refresh token');
-      }
-
-      const user = (await this.userService.findById(payload.sub)) as { id: string; email: string; [key: string]: any };
-      if (!user) {
-        this.logger.warn('Refresh token validation failed: User not found', {
-          userId: payload.sub,
-        });
-        throw new UserNotFoundException(payload.sub);
-      }
-
-      const refreshSessionData = await this.redisService.get(tokenRevocationRedisKeys.refreshSession(payload.rid));
-      if (!refreshSessionData) {
-        this.logger.warn('Refresh token validation failed: missing refresh session', { userId: payload.sub });
-        throw new TokenExpiredException('Invalid refresh token');
-      }
-
-      const refreshSession = JSON.parse(refreshSessionData) as {
-        userId: string;
-        sessionId: string;
-        fingerprint: string;
-      };
-      const currentRid = await this.redisService.get(tokenRevocationRedisKeys.userRefreshSession(payload.sub));
-
-      if (refreshSession.userId !== payload.sub || currentRid !== payload.rid) {
-        this.logger.warn('Refresh token validation failed: revoked or rotated', { userId: payload.sub });
-        throw new TokenExpiredException('Invalid refresh token');
-      }
-
-      const existingSession = await this.getSessionById(payload.sub, refreshSession.sessionId);
-      if (!existingSession) {
-        this.logger.warn('Refresh token validation failed: session missing', { userId: payload.sub });
-        throw new TokenExpiredException('Invalid refresh token');
-      }
-
-      this.assertFingerprintMatches(existingSession, requestMeta);
-      await this.invalidateSession(payload.sub, refreshSession.sessionId);
-
-      this.logger.logAuth('Token refreshed successfully', { userId: user.id });
-      return this.generateTokens(user, requestMeta);
-    } catch (error) {
-      const stack = error instanceof Error ? error.stack : undefined;
-      this.logger.error('Token refresh failed', stack);
-      throw new TokenExpiredException('Invalid refresh token');
-    }
-  }
-
-  async logout(userId: string, accessToken?: string) {
-    // Blacklist the current access token
-    if (accessToken) {
-      const tokenPayload = await this.jwtService.decode(accessToken);
-      if (tokenPayload && typeof tokenPayload === 'object' && 'jti' in tokenPayload) {
-        const jti = tokenPayload.jti;
-        const expiry = tokenPayload.exp;
-        if (jti && expiry) {
-          const ttl = expiry - Math.floor(Date.now() / 1000);
-          if (ttl > 0) {
-            await this.redisService.setex(tokenRevocationRedisKeys.accessRevoked(jti), ttl, userId);
-            this.logger.logAuth('Access token blacklisted', { userId, jti });
-          }
-        }
-      }
-    }
-
-    // === REFRESH TOKEN REVOCATION ===
-    // Prevents token refresh even if JWT signature is still valid
-
-    if (accessToken) {
-      const tokenPayload = this.jwtService.decode(accessToken) as JwtPayload | null;
-      if (tokenPayload?.sid) {
-        await this.invalidateSession(userId, tokenPayload.sid);
-      }
-    } else {
-      await this.clearRefreshSessionForUser(userId);
-    }
-    this.logger.logAuth('User logged out successfully', { userId });
-    return { message: 'Logged out successfully' };
-  }
-
-  async forgotPassword(email: string) {
-    const user = (await this.userService.findByEmail(email)) as {
-      id: string;
-      email: string;
-      [key: string]: any;
-    } | null;
-    if (!user) {
-      this.logger.log('Forgot password request for non-existent user', { email });
-      return { message: 'If email exists, a reset link has been sent' };
-    }
-
-    const resetToken = uuidv4();
-    const resetTokenExpiry = Date.now() + 3600000; // 1 hour
-
-    // Save reset token and expiry in Redis
-    await this.redisService.set(
-      `password_reset:${resetToken}`,
-      JSON.stringify({ userId: user.id, expiry: resetTokenExpiry }),
+    this.jwtRefreshSecret = jwtRefreshSecret;
+    this.accessTokenTtlSeconds = parseDuration(
+      this.configService.get<string>('JWT_ACCESS_EXPIRES_IN') ?? '15m',
+      15 * 60,
     );
-
-    await this.sendPasswordResetEmail(user.email, resetToken);
-    this.logger.log('Password reset email sent', { email });
-    return { message: 'If email exists, a reset link has been sent' };
-  }
-
-  async resetPassword(resetToken: string, newPassword: string) {
-    const resetData = await this.redisService.get(`password_reset:${resetToken}`);
-
-    if (!resetData) {
-      this.logger.warn('Invalid or expired password reset token received');
-      throw new InvalidInputException(undefined, 'Invalid or expired reset token');
-    }
-
-    const { userId, expiry } = JSON.parse(resetData);
-
-    if (Date.now() > expiry) {
-      await this.redisService.del(`password_reset:${resetToken}`);
-      this.logger.warn('Expired password reset token used', { userId });
-      throw new InvalidInputException(undefined, 'Reset token has expired');
-    }
-
-    await this.userService.updatePassword(userId, newPassword);
-    await this.redisService.del(`password_reset:${resetToken}`);
-    await this.invalidateAllSessions(userId);
-
-    this.logger.log('Password reset successfully', { userId });
-    return { message: 'Password reset successfully' };
-  }
-
-  async verifyEmail(token: string) {
-    const verificationData = await this.redisService.get(`email_verification:${token}`);
-
-    if (!verificationData) {
-      this.logger.warn('Invalid or expired email verification token');
-      throw new InvalidInputException(undefined, 'Invalid or expired verification token');
-    }
-
-    const { userId } = JSON.parse(verificationData);
-    await this.userService.verifyUser(userId);
-    await this.redisService.del(`email_verification:${token}`);
-
-    this.logger.log('Email verified successfully', { userId });
-    return { message: 'Email verified successfully' };
+    this.refreshTokenTtlSeconds = parseDuration(
+      this.configService.get<string>('JWT_REFRESH_EXPIRES_IN') ?? '7d',
+      7 * 24 * 60 * 60,
+    );
+    this.bcryptRounds = parseInt(this.configService.get<string>('BCRYPT_ROUNDS') ?? '12', 10);
   }
 
   /**
-   * Access-token revocation list (Redis). Entries use TTL so the key expires with the JWT.
+   * Helper to map transactions to activity items for dashboard
    */
-  async isTokenBlacklisted(jti: string): Promise<boolean> {
-    const blacklisted = await this.redisService.get(tokenRevocationRedisKeys.accessRevoked(jti));
-    return blacklisted !== null;
-  }
-
-  async getActiveSessions(userId: string): Promise<any[]> {
-    const sessionKeys = await this.redisService.keys(`active_session:${userId}:*`);
-    const sessions = [];
-
-    for (const key of sessionKeys) {
-      const sessionData = await this.redisService.get(key);
-      if (sessionData) {
-        sessions.push(JSON.parse(sessionData));
-      }
-    }
-
-    return sessions;
-  }
-
-  async getSessionById(userId: string, sessionId: string): Promise<SessionInfo | null> {
-    const sessionData = await this.redisService.get(tokenRevocationRedisKeys.activeSession(userId, sessionId));
-    return sessionData ? JSON.parse(sessionData) : null;
-  }
-
-  async getAllUserSessions(userId: string): Promise<any[]> {
-    const sessions = await this.getActiveSessions(userId);
-    return sessions.map(session => ({
-      ...session,
-      isActive: true,
-      expiresIn: this.getSessionExpiry(session.lastActivity || session.createdAt),
+  private transactionsToActivityItems(
+    transactions: TransactionWithPropertyTitle[],
+    type: 'purchase' | 'sale',
+  ) {
+    return transactions.map((tx) => ({
+      type: 'transaction' as const,
+      id: tx.id,
+      title: `Property ${type === 'purchase' ? 'Purchased' : 'Sold'}: ${tx.property?.title || 'Unknown'}`,
+      description: `${type === 'purchase' ? 'Bought' : 'Sold'} for $${tx.amount}`,
+      timestamp: tx.createdAt,
     }));
   }
 
-  async invalidateAllSessions(userId: string): Promise<void> {
-    const sessionKeys = await this.redisService.keys(`active_session:${userId}:*`);
-    for (const key of sessionKeys) {
-      const sessionData = await this.redisService.get(key);
-      if (sessionData) {
-        const session = JSON.parse(sessionData) as SessionInfo;
-        await this.redisService.del(tokenRevocationRedisKeys.accessSession(session.jti));
-        await this.redisService.del(tokenRevocationRedisKeys.refreshSession(session.refreshSessionId));
-      }
-      await this.redisService.del(key);
-    }
-    await this.clearRefreshSessionForUser(userId);
-    this.logger.logAuth('All sessions invalidated', { userId });
-  }
-
-  async getConcurrentSessions(userId: string): Promise<number> {
-    const sessions = await this.getActiveSessions(userId);
-    return sessions.length;
-  }
-
-  private getSessionExpiry(createdAt: string): number {
-    const created = new Date(createdAt);
-    const sessionTimeout = this.configService.get<number>('SESSION_TIMEOUT', 3600) * 1000;
-    const expiry = created.getTime() + sessionTimeout;
-    return Math.max(0, expiry - Date.now());
-  }
-
-  async invalidateSession(userId: string, sessionId: string): Promise<void> {
-    const session = await this.getSessionById(userId, sessionId);
-    if (session) {
-      await this.redisService.del(tokenRevocationRedisKeys.accessSession(session.jti));
-      await this.redisService.del(tokenRevocationRedisKeys.refreshSession(session.refreshSessionId));
-      const currentRid = await this.redisService.get(tokenRevocationRedisKeys.userRefreshSession(userId));
-      if (currentRid === session.refreshSessionId) {
-        await this.redisService.del(tokenRevocationRedisKeys.userRefreshSession(userId));
-      }
-      const ttl = this.getSessionExpiry(session.lastActivity || session.createdAt);
-      if (ttl > 0) {
-        await this.redisService.setex(
-          tokenRevocationRedisKeys.accessRevoked(session.jti),
-          Math.ceil(ttl / 1000),
-          userId,
+  async register(data: RegisterDto, ipAddress?: string) {
+    // Block re-registration from same IP until prior email is verified
+    if (ipAddress) {
+      const allowed = this.canRegisterFromIp(ipAddress);
+      if (!allowed) {
+        throw new BadRequestException(
+          'A registration from this IP is already pending email verification. Please verify your email before registering a new account.',
         );
       }
     }
-    await this.redisService.del(tokenRevocationRedisKeys.activeSession(userId, sessionId));
-    this.logger.logAuth('Session invalidated', { userId, sessionId });
-  }
 
-  async validateActiveSession(
-    userId: string,
-    jti: string,
-    sessionId: string,
-    requestMeta?: { ip?: string; userAgent?: string },
-  ): Promise<SessionInfo> {
-    const mappedSessionId = await this.redisService.get(tokenRevocationRedisKeys.accessSession(jti));
-    if (!mappedSessionId || mappedSessionId !== sessionId) {
-      throw new UnauthorizedException('Session is no longer active');
+    const existingUser = await this.usersService.findByEmail(data.email);
+    if (existingUser) {
+      throw new BadRequestException('A user with that email already exists');
     }
 
-    const session = await this.getSessionById(userId, sessionId);
-    if (!session || session.jti !== jti) {
-      throw new UnauthorizedException('Session is no longer active');
+    const passwordErrors = validatePassword(data.password, this.configService);
+    if (passwordErrors.length > 0) {
+      throw new BadRequestException(
+        `Password does not meet complexity requirements: ${passwordErrors.join('; ')}`,
+      );
     }
 
-    const absoluteExpiry = session.absoluteExpiresAt ? new Date(session.absoluteExpiresAt).getTime() : 0;
-    if (absoluteExpiry && absoluteExpiry <= Date.now()) {
-      await this.invalidateSession(userId, sessionId);
-      throw new UnauthorizedException('Session has expired');
-    }
-
-    this.assertFingerprintMatches(session, requestMeta);
-
-    const idleTimeoutSeconds = this.configService.get<number>('SESSION_TIMEOUT', 3600);
-    const lastActivity = new Date(session.lastActivity || session.createdAt).getTime();
-    if (Date.now() - lastActivity > idleTimeoutSeconds * 1000) {
-      await this.invalidateSession(userId, sessionId);
-      throw new UnauthorizedException('Session has expired');
-    }
-
-    const updatedSession: SessionInfo = {
-      ...session,
-      lastActivity: new Date().toISOString(),
-      ip: requestMeta?.ip || session.ip,
-      userAgent: requestMeta?.userAgent || session.userAgent,
-    };
-
-    await this.persistSession(updatedSession);
-    return updatedSession;
-  }
-
-  private async clearRefreshSessionForUser(userId: string): Promise<void> {
-    const rid = await this.redisService.get(tokenRevocationRedisKeys.userRefreshSession(userId));
-    if (rid) {
-      await this.redisService.del(tokenRevocationRedisKeys.refreshSession(rid));
-    }
-    await this.redisService.del(tokenRevocationRedisKeys.userRefreshSession(userId));
-  }
-
-  private refreshSessionTtlSeconds(refreshToken: string): number {
-    const decoded = this.jwtService.decode(refreshToken) as { exp?: number } | null;
-    if (!decoded?.exp) {
-      return 0;
-    }
-    return Math.max(0, decoded.exp - Math.floor(Date.now() / 1000));
-  }
-
-  private async generateTokens(user: any, requestMeta?: { ip?: string; userAgent?: string }) {
-    await this.clearRefreshSessionForUser(user.id);
-
-    const jti = uuidv4();
-    const sessionId = uuidv4();
-    const refreshSessionId = uuidv4();
-
-    const accessPayload: JwtPayload = {
-      sub: user.id,
-      email: user.email,
-      jti,
-      sid: sessionId,
-      tokenUse: JWT_TOKEN_USE.ACCESS,
-    };
-
-    const refreshPayload: JwtPayload = {
-      sub: user.id,
-      email: user.email,
-      sid: sessionId,
-      rid: refreshSessionId,
-      tokenUse: JWT_TOKEN_USE.REFRESH,
-    };
-
-    const accessToken = this.jwtService.sign(accessPayload, {
-      secret: this.configService.get<string>('JWT_SECRET'),
-      expiresIn: this.configService.get<string>('JWT_EXPIRES_IN', '15m') as any,
-    });
-
-    const refreshToken = this.jwtService.sign(refreshPayload, {
-      secret: this.configService.get<string>('JWT_REFRESH_SECRET'),
-      expiresIn: this.configService.get<string>('JWT_REFRESH_EXPIRES_IN', '7d') as any,
-    });
-
-    let refreshTtl = this.refreshSessionTtlSeconds(refreshToken);
-    if (refreshTtl <= 0) {
-      refreshTtl = 7 * 24 * 60 * 60;
-    }
-    const sessionMeta = this.buildSessionInfo(user.id, sessionId, jti, refreshSessionId, requestMeta);
-    await this.redisService.setex(
-      tokenRevocationRedisKeys.refreshSession(refreshSessionId),
-      refreshTtl,
-      JSON.stringify({
-        userId: user.id,
-        sessionId,
-        fingerprint: sessionMeta.fingerprint,
-      }),
+    const passwordHash = await hashPassword(data.password, this.bcryptRounds);
+    const verificationToken = randomToken(32);
+    const verificationExpiresAt = new Date(
+      Date.now() +
+        parseDuration(
+          this.configService.get<string>('EMAIL_VERIFICATION_EXPIRES_IN') ?? '24h',
+          24 * 60 * 60,
+        ) *
+          1000,
     );
-    await this.redisService.setex(tokenRevocationRedisKeys.userRefreshSession(user.id), refreshTtl, refreshSessionId);
 
-    const sessionExpiry = this.configService.get<number>('SESSION_TIMEOUT', 3600);
-    await this.redisService.setex(tokenRevocationRedisKeys.accessSession(jti), sessionExpiry, sessionId);
-    await this.persistSession(sessionMeta);
+    const user = await this.prisma.user.create({
+      data: {
+        email: data.email,
+        password: passwordHash,
+        firstName: data.firstName,
+        lastName: data.lastName,
+        phone: data.phone,
+        emailVerificationToken: verificationToken,
+        emailVerificationExpires: verificationExpiresAt,
+        passwordHistory: {
+          create: {
+            passwordHash,
+          },
+        },
+      },
+    });
 
-    this.logger.debug('Generated new tokens for user', { userId: user.id, jti, refreshSessionId, sessionId });
+    userRegistrationsTotal.inc({ method: 'email' });
+
+    // Send verification email and await result
+    await this.emailService
+      .sendEmail({
+        to: user.email,
+        subject: 'Verify your email - PropChain',
+        template: 'email-verification',
+        context: { token: verificationToken },
+        userId: user.id,
+        emailType: 'email_verification',
+      })
+      .catch((err) => {
+        this.logger.error('Failed to queue verification email:', err?.message || err);
+      });
+
+    // Only issue short-lived verification token after email is sent
+    // Full token pair is issued in verifyInitialEmail after verification succeeds
+
+    // Track IP for re-registration prevention
+    if (ipAddress) {
+      const expiryMs =
+        parseDuration(
+          this.configService.get<string>('EMAIL_VERIFICATION_EXPIRES_IN') ?? '24h',
+          24 * 60 * 60,
+        ) * 1000;
+      this.registrationIpMap.set(ipAddress, {
+        email: user.email,
+        expiresAt: new Date(Date.now() + expiryMs),
+      });
+    }
 
     return {
-      access_token: accessToken,
-      refresh_token: refreshToken,
-      user: {
-        id: user.id,
-        email: user.email,
-        walletAddress: user.walletAddress,
-        isVerified: user.isVerified,
+      user: sanitizeUser(user),
+      message: 'Registration successful. Please check your email to verify your account.',
+      verificationToken,
+    };
+  }
+
+  private canRegisterFromIp(ipAddress: string): boolean {
+    const entry = this.registrationIpMap.get(ipAddress);
+    if (!entry) return true;
+    if (Date.now() > entry.expiresAt.getTime()) {
+      this.registrationIpMap.delete(ipAddress);
+      return true;
+    }
+    return false;
+  }
+
+  private cleanupIpForEmail(email: string): void {
+    for (const [ip, entry] of this.registrationIpMap.entries()) {
+      if (entry.email === email) {
+        this.registrationIpMap.delete(ip);
+        return;
+      }
+    }
+  }
+
+  /**
+   * Performs mandatory security checks before validating credentials.
+   *
+   * Ordering Contract:
+   * 1. Lockout check: Prevent any further action if account is temporarily locked.
+   * 2. CAPTCHA check: If failed attempts exceed threshold, require CAPTCHA to proceed.
+   * 3. Credentials check: (Performed in the main login method after preflight)
+   */
+  private async preflightChecks(
+    data: LoginDto,
+    ipAddress?: string,
+    userAgent?: string,
+  ): Promise<void> {
+    // Check if account is locked out
+    const isLocked = await this.rateLimitService.isAccountLocked(data.email);
+    if (isLocked) {
+      const lockoutInfo = await this.rateLimitService.getLockoutInfo(data.email);
+      const remainingMinutes = lockoutInfo?.remainingLockoutMinutes ?? 0;
+      throw new UnauthorizedException(
+        `Account temporarily locked due to too many failed login attempts. Please try again in ${remainingMinutes} minute${remainingMinutes !== 1 ? 's' : ''}.`,
+      );
+    }
+
+    const failedAttempts = await this.rateLimitService.getFailedAttemptsCount(data.email);
+    const captchaThreshold = parseInt(
+      this.configService.get<string>('CAPTCHA_THRESHOLD') ?? '3',
+      10,
+    );
+
+    if (failedAttempts >= captchaThreshold) {
+      if (!data.captchaToken) {
+        throw new UnauthorizedException('CAPTCHA verification required');
+      }
+      const isCaptchaValid = await this.verifyCaptcha(data.captchaToken);
+      if (!isCaptchaValid) {
+        await this.rateLimitService.recordFailedAttempt(data.email, ipAddress, userAgent);
+        throw new UnauthorizedException('Invalid CAPTCHA');
+      }
+    }
+  }
+
+  /**
+   * Verify a fetched user's credentials: account state checks (blocked/
+   * deactivated/unverified) and bcrypt password comparison.
+   *
+   * Centralises the post-findByEmail gating plus the bcrypt compare and the
+   * rate-limit / fraud / lockout-email side effects. Extracted from login()
+   * for testability and readability (issue #744).
+   *
+   * @throws UnauthorizedException on any gate failure or password mismatch
+   */
+  private async verifyCredentials(
+    user: {
+      id: string;
+      email: string;
+      password: string | null;
+      isBlocked: boolean;
+      isDeactivated: boolean;
+      isVerified: boolean;
+    },
+    password: string,
+    ipAddress?: string,
+    userAgent?: string,
+  ): Promise<void> {
+    if (user.isBlocked) {
+      throw new UnauthorizedException('Your account has been blocked. Please contact support.');
+    }
+    if (user.isDeactivated) {
+      throw new UnauthorizedException(
+        'Your account has been deactivated. Please contact support to reactivate your account.',
+      );
+    }
+    if (!user.isVerified) {
+      throw new UnauthorizedException('Please verify your email before logging in.');
+    }
+
+    const passwordMatches = await comparePassword(password, user.password ?? '');
+    if (!passwordMatches) {
+      const shouldLock = await this.rateLimitService.recordFailedAttempt(
+        user.email,
+        ipAddress,
+        userAgent,
+      );
+      await this.fraudService.evaluateFailedLogin(user.email, ipAddress, userAgent);
+
+      if (shouldLock) {
+        const lockoutDuration = 30;
+        await this.emailService.sendAccountLockedEmail(user.email, lockoutDuration).catch((err) => {
+          this.logger.error('Failed to send account locked email', {
+            event: 'auth.lockout_email_failed',
+            userId: user.id,
+            emailHash: this.hashEmail(user.email),
+            error: err.message,
+          });
+        });
+        throw new UnauthorizedException(
+          `Account locked due to too many failed login attempts. Please try again in ${lockoutDuration} minutes.`,
+        );
+      }
+
+      throw new UnauthorizedException('Invalid credentials');
+    }
+  }
+
+  async login(data: LoginDto, ipAddress?: string, userAgent?: string) {
+    await this.preflightChecks(data, ipAddress, userAgent);
+
+    const user = await this.usersService.findByEmail(data.email);
+    if (!user) {
+      // Record failed attempt even if user doesn't exist (prevent enumeration)
+      await this.rateLimitService.recordFailedAttempt(data.email, ipAddress, userAgent);
+      throw new UnauthorizedException('Invalid credentials');
+    }
+
+    await this.verifyCredentials(user, data.password, ipAddress, userAgent);
+
+    // #1291 — a previously trusted device may skip the second-factor challenge.
+    let trustedDeviceAccepted = false;
+    if (user.twoFactorEnabled && this.twoFactorService) {
+      trustedDeviceAccepted = await this.twoFactorService.isTrustedDevice(
+        user.id,
+        data.trustedDeviceToken,
+      );
+    }
+
+    if (user.twoFactorEnabled && !trustedDeviceAccepted) {
+      const hasTotpCode = Boolean(data.totpCode?.trim());
+      const hasBackupCode = Boolean(data.backupCode?.trim());
+
+      if (!hasTotpCode && !hasBackupCode) {
+        throw new UnauthorizedException('Two-factor authentication code required');
+      }
+
+      if (hasTotpCode) {
+        const totpCode = data.totpCode;
+        if (!totpCode || !user.twoFactorSecret) {
+          throw new UnauthorizedException('Invalid two-factor authentication code');
+        }
+
+        const validCode = verifyTotpCode({
+          secret: user.twoFactorSecret,
+          code: totpCode,
+        });
+
+        if (!validCode) {
+          throw new UnauthorizedException('Invalid two-factor authentication code');
+        }
+      } else if (hasBackupCode) {
+        const backupCode = data.backupCode;
+        if (!backupCode) {
+          throw new UnauthorizedException('Two-factor authentication code required');
+        }
+
+        const matchingBackupCode = verifyBackupCode(backupCode, user.twoFactorBackupCodes);
+        if (!matchingBackupCode) {
+          throw new UnauthorizedException('Invalid backup code');
+        }
+
+        await this.prisma.user.update({
+          where: { id: user.id },
+          data: {
+            twoFactorBackupCodes: {
+              set: user.twoFactorBackupCodes.filter((code: string) => code !== matchingBackupCode),
+            },
+          },
+        });
+      } else {
+        // 2FA is enabled but no usable factor was supplied — never fall through
+        // without a successful challenge.
+        throw new UnauthorizedException('Two-factor authentication code required');
+      }
+    }
+
+    // Record successful login
+    await this.rateLimitService.recordSuccessfulAttempt(data.email, ipAddress, userAgent);
+    await this.recordLoginHistory(user.id, ipAddress, userAgent);
+    await this.fraudService.evaluateSuccessfulLogin(user.id, ipAddress, userAgent);
+    userLoginsTotal.inc({ method: 'email' });
+    // Issue #961 — geo + device fingerprint fed into the post-login fraud
+    // evaluation pipeline (velocity / impossible travel / device mismatch).
+    // FraudService resolves both fields from its own injected helpers.
+    try {
+      await this.fraudService.recordLoginContext(user.id, {
+        ipAddress,
+        userAgent,
+      });
+    } catch (contextError) {
+      // Auth.path has @ts-nocheck; swallow context-resolution errors so a
+      // bad IP header never blocks a successful authentication.
+    }
+
+    const refreshedUser = await this.prisma.user.findUnique({
+      where: { id: user.id },
+    });
+
+    if (!refreshedUser) {
+      throw new UnauthorizedException('User no longer exists');
+    }
+
+    if (refreshedUser.isBlocked) {
+      throw new UnauthorizedException(
+        'Your account has been blocked after a fraud review. Please contact support.',
+      );
+    }
+
+    const tokens = await this.issueTokenPair(refreshedUser, undefined, ipAddress, userAgent);
+
+    // #1291 — optionally remember this device so subsequent logins can skip the
+    // challenge. Only issued when the user actually proved the second factor.
+    let trustedDevice: { token: string; device: { expiresAt: Date } } | null = null;
+    if (
+      data.rememberDevice &&
+      refreshedUser.twoFactorEnabled &&
+      !trustedDeviceAccepted &&
+      this.twoFactorService
+    ) {
+      trustedDevice = await this.twoFactorService.rememberDevice(refreshedUser.id, {
+        userAgent,
+        ipAddress,
+      });
+    }
+
+    return {
+      user: sanitizeUser(refreshedUser),
+      ...tokens,
+      ...(trustedDevice
+        ? {
+            trustedDeviceToken: trustedDevice.token,
+            trustedDeviceExpiresAt: trustedDevice.device.expiresAt,
+          }
+        : {}),
+    };
+  }
+
+  async refreshToken(data: RefreshTokenDto, ipAddress?: string, userAgent?: string) {
+    const payload = this.verifyToken(data.refreshToken, this.jwtRefreshSecret) as JwtPayload;
+
+    if (payload.type !== 'refresh') {
+      throw new UnauthorizedException('Invalid refresh token');
+    }
+
+    // Check if token is blacklisted (already used)
+    const blacklistedToken = await this.prisma.blacklistedToken.findUnique({
+      where: { jti: payload.jti },
+    });
+
+    if (blacklistedToken) {
+      // TOKEN REUSE DETECTED! This is a potential attack
+      // Mark the reuse and invalidate the entire token family
+      await this.handleTokenReuse(blacklistedToken, payload.jti, ipAddress, userAgent);
+      await this.fraudService.handleTokenReuse(payload.sub, payload.jti, ipAddress, userAgent);
+
+      this.logger.error('Refresh token reuse detected', {
+        event: 'auth.refresh_token_reuse',
+        userId: payload.sub,
+        jti: payload.jti,
+        family: payload.family,
+        ipAddress,
+      });
+
+      throw new UnauthorizedException(
+        'Token reuse detected. All sessions have been invalidated for security. Please login again.',
+      );
+    }
+
+    const user = await this.prisma.user.findUnique({
+      where: { id: payload.sub },
+    });
+    if (!user) {
+      throw new UnauthorizedException('User no longer exists');
+    }
+
+    if (user.isBlocked) {
+      throw new UnauthorizedException('Your account has been blocked');
+    }
+
+    if (user.isDeactivated) {
+      throw new UnauthorizedException('Your account has been deactivated');
+    }
+
+    // Blacklist the current refresh token (rotation)
+    await this.blacklistToken({
+      jti: payload.jti,
+      tokenType: 'REFRESH',
+      expiresAt: new Date((payload.exp ?? 0) * 1000),
+      userId: user.id,
+      tokenFamily: payload.family,
+      ipAddress,
+      userAgent,
+    });
+
+    // Issue new token pair with SAME family ID
+    const tokens = await this.issueTokenPair(user, payload.family, ipAddress, userAgent);
+
+    this.logger.log('Refresh token rotated', {
+      event: 'auth.token_rotated',
+      userId: user.id,
+      emailHash: this.hashEmail(user.email),
+      family: payload.family,
+      ipAddress,
+    });
+
+    return {
+      user: sanitizeUser(user),
+      ...tokens,
+    };
+  }
+
+  /**
+   * Handle token reuse detection - invalidate entire token family
+   */
+  private async handleTokenReuse(
+    blacklistedToken: BlacklistedToken,
+    reusedJti: string,
+    ipAddress?: string,
+    userAgent?: string,
+  ) {
+    const now = new Date();
+
+    // Mark the reused token
+    await this.prisma.blacklistedToken.update({
+      where: { jti: reusedJti },
+      data: {
+        reusedAt: now,
+        ipAddress: ipAddress || blacklistedToken.ipAddress,
+        userAgent: userAgent || blacklistedToken.userAgent,
+      },
+    });
+
+    // Invalidate entire token family if it exists
+    if (blacklistedToken.tokenFamily) {
+      // Only the count is logged, so count in the database instead of fetching rows.
+      const familyTokenCount = await this.prisma.blacklistedToken.count({
+        where: {
+          tokenFamily: blacklistedToken.tokenFamily,
+          expiresAt: { gt: now }, // Only active tokens
+        },
+      });
+
+      this.logger.warn(
+        `Invalidating ${familyTokenCount} tokens in family ${blacklistedToken.tokenFamily} due to reuse detection`,
+      );
+
+      // All tokens in this family are already blacklisted, but we log the event
+      // The key is that we're preventing the attacker from using any token from this family
+    }
+  }
+
+  async logout(user: AuthUserPayload, refreshToken?: string, accessToken?: string) {
+    const logoutTime = new Date();
+
+    // Blacklist the access token if provided
+    if (accessToken) {
+      try {
+        const accessPayload = this.verifyToken(accessToken, this.jwtSecret) as JwtPayload;
+        await this.blacklistToken({
+          jti: accessPayload.jti,
+          tokenType: 'ACCESS',
+          expiresAt: new Date((accessPayload.exp ?? 0) * 1000),
+          userId: user.sub,
+          tokenFamily: accessPayload.family,
+        });
+      } catch (error: unknown) {
+        // Token might already be expired or invalid, continue with logout
+        this.logger.warn('Failed to blacklist access token', {
+          event: 'auth.blacklist_access_token_failed',
+          userId: user.sub,
+          error: (error as Error).message,
+        });
+      }
+    }
+
+    // Blacklist the specific refresh token if provided
+    if (refreshToken) {
+      try {
+        const refreshPayload = this.verifyToken(refreshToken, this.jwtRefreshSecret) as JwtPayload;
+        if (refreshPayload.sub !== user.sub) {
+          throw new UnauthorizedException('Refresh token does not belong to the current user');
+        }
+
+        await this.blacklistToken({
+          jti: refreshPayload.jti,
+          tokenType: 'REFRESH',
+          expiresAt: new Date((refreshPayload.exp ?? 0) * 1000),
+          userId: user.sub,
+          tokenFamily: refreshPayload.family,
+        });
+      } catch (error: unknown) {
+        if (error instanceof UnauthorizedException) {
+          throw error;
+        }
+        // Token might already be expired or invalid, continue with logout
+        this.logger.warn('Failed to blacklist refresh token', {
+          event: 'auth.blacklist_refresh_token_failed',
+          userId: user.sub,
+          error: (error as Error).message,
+        });
+      }
+    }
+
+    // Log the logout event
+    this.logger.log('User logged out', {
+      event: 'auth.logout',
+      userId: user.sub,
+      emailHash: this.hashEmail(user.email),
+      loggedOutAt: logoutTime.toISOString(),
+    });
+
+    return {
+      message: 'Logged out successfully',
+      logoutTime: logoutTime.toISOString(),
+      tokensInvalidated: {
+        accessToken: !!accessToken,
+        refreshToken: !!refreshToken,
+      },
+      clientAction: {
+        clearStorage: true,
+        clearCookies: true,
+        redirectUrl: '/login',
       },
     };
   }
 
-  private async sendVerificationEmail(userId: string, email: string) {
-    const verificationToken = uuidv4();
+  async logoutAllDevices(user: AuthUserPayload, accessToken?: string) {
+    const logoutTime = new Date();
 
-    // Save token in Redis
-    const expiry = Date.now() + 3600000; // 1 hour
-    await this.redisService.set(`email_verification:${verificationToken}`, JSON.stringify({ userId, expiry }));
+    // Blacklist the current access token if provided
+    if (accessToken) {
+      try {
+        const accessPayload = this.verifyToken(accessToken, this.jwtSecret) as JwtPayload;
+        await this.blacklistToken({
+          jti: accessPayload.jti,
+          tokenType: 'ACCESS',
+          expiresAt: new Date((accessPayload.exp ?? 0) * 1000),
+          userId: user.sub,
+        });
+      } catch (error: unknown) {
+        this.logger.warn(
+          `Failed to blacklist access token for user ${user.sub}: ${(error as Error).message}`,
+        );
+      }
+    }
 
-    // Import EmailService and send actual email
-    const { EmailService } = await import('../communication/email/email.service');
-    const emailService = new EmailService(this.configService, null, null, null);
+    await this.sessionsService.revokeAllSessions(user.sub);
 
-    await emailService.sendTemplatedEmail(email, 'email-verification', {
-      firstName: email.split('@')[0], // Extract name from email for personalization
-      verificationUrl: `${this.configService.get<string>('BASE_URL')}/auth/verify-email/${verificationToken}`,
+    // Find all blacklisted refresh tokens for this user that are still active
+    const blacklistedRefreshTokenCount = await this.prisma.blacklistedToken.count({
+      where: {
+        userId: user.sub,
+        tokenType: 'REFRESH',
+        expiresAt: {
+          gt: logoutTime, // Only count tokens that haven't expired yet
+        },
+      },
     });
 
-    this.logger.log(`Verification email sent to ${email}`, { userId });
-    this.logger.debug(`Verification token generated for ${email}`, { userId });
-  }
-
-  private async sendPasswordResetEmail(email: string, resetToken: string) {
-    // Import EmailService and send actual email
-    const { EmailService } = await import('../communication/email/email.service');
-    const emailService = new EmailService(this.configService, null, null, null);
-
-    await emailService.sendTemplatedEmail(email, 'password-reset', {
-      firstName: email.split('@')[0], // Extract name from email for personalization
-      resetUrl: `${this.configService.get<string>('BASE_URL')}/auth/reset-password/${resetToken}`,
-    });
-
-    this.logger.log(`Password reset email sent to ${email}`);
-    this.logger.debug(`Password reset token generated for ${email}`);
-  }
-
-  private buildSessionInfo(
-    userId: string,
-    sessionId: string,
-    jti: string,
-    refreshSessionId: string,
-    requestMeta?: { ip?: string; userAgent?: string },
-  ): SessionInfo {
-    const now = new Date();
-    const absoluteLifetimeSeconds = this.configService.get<number>('SESSION_ABSOLUTE_TIMEOUT', 86400);
+    this.logger.log(
+      `User ${user.sub} (${this.hashEmail(user.email)}) logged out from all devices at ${logoutTime.toISOString()}. Total active blacklisted refresh tokens: ${blacklistedRefreshTokenCount}`,
+    );
 
     return {
-      sessionId,
-      userId,
-      jti,
-      refreshSessionId,
-      createdAt: now.toISOString(),
-      lastActivity: now.toISOString(),
-      userAgent: requestMeta?.userAgent || 'unknown',
-      ip: requestMeta?.ip || 'unknown',
-      absoluteExpiresAt: new Date(now.getTime() + absoluteLifetimeSeconds * 1000).toISOString(),
-      fingerprint: this.buildFingerprint(requestMeta),
+      message: 'Logged out from all devices successfully',
+      logoutTime: logoutTime.toISOString(),
+      blacklistedTokensCount: blacklistedRefreshTokenCount,
+      clientAction: {
+        clearStorage: true,
+        clearCookies: true,
+        redirectUrl: '/login',
+      },
     };
   }
 
-  private async persistSession(session: SessionInfo): Promise<void> {
-    const sessionExpiry = this.configService.get<number>('SESSION_TIMEOUT', 3600);
-    await this.redisService.setex(
-      tokenRevocationRedisKeys.activeSession(session.userId, session.sessionId),
-      sessionExpiry,
-      JSON.stringify(session),
-    );
-    await this.redisService.setex(
-      tokenRevocationRedisKeys.accessSession(session.jti),
-      sessionExpiry,
-      session.sessionId,
+  async me(user: AuthUserPayload) {
+    const foundUser = await this.prisma.user.findUnique({
+      where: { id: user.sub },
+    });
+
+    if (!foundUser) {
+      throw new NotFoundException('User not found');
+    }
+
+    return sanitizeUser(foundUser);
+  }
+
+  /**
+   * Dashboard summary, cached for 30 seconds per user (Redis via CacheService).
+   * Data may be up to 30s stale; any cache failure falls back to computing it.
+   */
+  async getDashboard(user: AuthUserPayload) {
+    if (!this.authCache) return this.loadDashboard(user);
+    return this.authCache.remember(
+      this.authCache.dashboardKey(user.sub),
+      AUTH_DASHBOARD_TTL_SECONDS,
+      () => this.loadDashboard(user),
     );
   }
 
-  private buildFingerprint(requestMeta?: { ip?: string; userAgent?: string }): string {
-    const source = `${requestMeta?.ip || 'unknown'}|${requestMeta?.userAgent || 'unknown'}`;
-    return createHash('sha256').update(source).digest('hex');
+  private async loadDashboard(user: AuthUserPayload) {
+    const foundUser = await this.prisma.user.findUnique({
+      where: { id: user.sub },
+    });
+
+    if (!foundUser) {
+      throw new NotFoundException('User not found');
+    }
+
+    // The recent-properties list was fetched here but never used, so it is no longer queried.
+    const [buyerTransactions, sellerTransactions, documents, apiKeysCount] = await Promise.all([
+      this.prisma.transaction.findMany({
+        where: { buyerId: user.sub },
+        orderBy: { createdAt: 'desc' },
+        take: 5,
+        include: {
+          property: {
+            select: {
+              id: true,
+              title: true,
+              address: true,
+              city: true,
+              state: true,
+              price: true,
+            },
+          },
+          seller: {
+            select: {
+              firstName: true,
+              lastName: true,
+            },
+          },
+        },
+      }),
+      this.prisma.transaction.findMany({
+        where: { sellerId: user.sub },
+        orderBy: { createdAt: 'desc' },
+        take: 5,
+        include: {
+          property: {
+            select: {
+              id: true,
+              title: true,
+              address: true,
+              city: true,
+              state: true,
+              price: true,
+            },
+          },
+          buyer: {
+            select: {
+              firstName: true,
+              lastName: true,
+            },
+          },
+        },
+      }),
+      this.prisma.document.findMany({
+        where: { userId: user.sub },
+        orderBy: { createdAt: 'desc' },
+        take: 5,
+      }),
+      this.prisma.apiKey.count({ where: { userId: user.sub } }),
+    ]);
+
+    const [
+      totalProperties,
+      activeListings,
+      pendingSales,
+      totalPurchases,
+      totalSales,
+      completedPurchases,
+      completedSales,
+    ] = await Promise.all([
+      this.prisma.property.count({ where: { ownerId: user.sub } }),
+      this.prisma.property.count({ where: { ownerId: user.sub, status: 'ACTIVE' } }),
+      this.prisma.transaction.count({ where: { sellerId: user.sub, status: 'PENDING' } }),
+      this.prisma.transaction.count({ where: { buyerId: user.sub } }),
+      this.prisma.transaction.count({ where: { sellerId: user.sub } }),
+      this.prisma.transaction.count({ where: { buyerId: user.sub, status: 'COMPLETED' } }),
+      this.prisma.transaction.count({ where: { sellerId: user.sub, status: 'COMPLETED' } }),
+    ]);
+
+    const recommendationProperties = await this.prisma.property.findMany({
+      where: {
+        status: 'ACTIVE',
+        ownerId: { not: user.sub },
+        NOT: {
+          ownerId: user.sub,
+        },
+      },
+      orderBy: { createdAt: 'desc' },
+      take: 5,
+      include: {
+        owner: {
+          select: {
+            firstName: true,
+            lastName: true,
+          },
+        },
+      },
+    });
+
+    const recentActivity = [
+      ...this.transactionsToActivityItems(buyerTransactions, 'purchase'),
+      ...this.transactionsToActivityItems(sellerTransactions, 'sale'),
+      ...documents.map((doc: Document) => ({
+        type: 'document' as const,
+        id: doc.id,
+        title: doc.fileName,
+        description: `Uploaded ${doc.documentType.toLowerCase().replace('_', ' ')}`,
+        timestamp: doc.createdAt,
+      })),
+    ]
+      .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
+      .slice(0, 10);
+
+    return {
+      profile: sanitizeUser(foundUser),
+      quickStats: {
+        totalProperties,
+        activeListings,
+        pendingSales,
+        totalPurchases,
+        totalSales,
+        completedPurchases,
+        completedSales,
+        apiKeysCount,
+      },
+      recentActivity,
+      recommendations: recommendationProperties.map((p: PropertyWithOwnerName) => ({
+        id: p.id,
+        title: p.title,
+        address: p.address,
+        city: p.city,
+        state: p.state,
+        price: p.price.toString(),
+        propertyType: p.propertyType,
+        bedrooms: p.bedrooms,
+        bathrooms: p.bathrooms?.toString(),
+        squareFeet: p.squareFeet?.toString(),
+        status: p.status,
+        agent: `${p.owner.firstName} ${p.owner.lastName}`,
+        createdAt: p.createdAt,
+      })),
+    };
   }
 
-  private assertFingerprintMatches(session: SessionInfo, requestMeta?: { ip?: string; userAgent?: string }): void {
-    if (!session.fingerprint) {
+  /** Throws a 400 listing every complexity rule the password breaks. */
+  private assertPasswordMeetsPolicy(newPassword: string): void {
+    const passwordErrors = validatePassword(newPassword, this.configService);
+    if (passwordErrors.length > 0) {
+      throw new BadRequestException(
+        `Password does not meet complexity requirements: ${passwordErrors.join('; ')}`,
+      );
+    }
+  }
+
+  /** Throws a 400 if `newPassword` matches any of the recent password hashes. */
+  private async assertPasswordNotReused(
+    newPassword: string,
+    recentHashes: string[],
+    historyLimit: number,
+  ): Promise<void> {
+    const reused = await Promise.all(
+      recentHashes.map((hash) => comparePassword(newPassword, hash)),
+    );
+    if (reused.some(Boolean)) {
+      throw new BadRequestException(
+        `Password reuse is not allowed for the last ${historyLimit} passwords`,
+      );
+    }
+  }
+
+  /** Stores the new hash and deletes history entries beyond the retention limit. */
+  private async recordPasswordHistory(
+    tx: Prisma.TransactionClient,
+    userId: string,
+    passwordHash: string,
+    historyLimit: number,
+  ): Promise<void> {
+    await tx.passwordHistory.create({ data: { userId, passwordHash } });
+
+    const expired = await tx.passwordHistory.findMany({
+      where: { userId },
+      orderBy: { createdAt: 'desc' },
+      skip: historyLimit,
+    });
+    if (expired.length > 0) {
+      await tx.passwordHistory.deleteMany({
+        where: { id: { in: expired.map((entry: { id: string }) => entry.id) } },
+      });
+    }
+  }
+
+  async changePassword(user: AuthUserPayload, data: ChangePasswordDto) {
+    const passwordHistoryLimit = this.getPasswordHistoryLimit();
+    const existingUser = await this.prisma.user.findUnique({
+      where: { id: user.sub },
+      include: {
+        passwordHistory: {
+          orderBy: { createdAt: 'desc' },
+        },
+      },
+    });
+
+    if (!existingUser) {
+      throw new NotFoundException('User not found');
+    }
+
+    const currentPasswordMatches = await comparePassword(
+      data.currentPassword,
+      existingUser.password ?? '',
+    );
+    if (!currentPasswordMatches) {
+      throw new UnauthorizedException('Current password is incorrect');
+    }
+
+    this.assertPasswordMeetsPolicy(data.newPassword);
+    await this.assertPasswordNotReused(
+      data.newPassword,
+      existingUser.passwordHistory
+        .slice(0, passwordHistoryLimit)
+        .map((entry: { passwordHash: string }) => entry.passwordHash),
+      passwordHistoryLimit,
+    );
+
+    const newPasswordHash = await hashPassword(data.newPassword, this.bcryptRounds);
+
+    await this.prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+      await tx.user.update({
+        where: { id: existingUser.id },
+        data: {
+          password: newPasswordHash,
+        },
+      });
+
+      await this.recordPasswordHistory(tx, existingUser.id, newPasswordHash, passwordHistoryLimit);
+    });
+
+    // Audit log password change (#886)
+    await this.prisma.activityLog
+      .create({
+        data: {
+          userId: user.sub,
+          action: 'PASSWORD_CHANGED',
+          entityType: 'USER',
+          entityId: user.sub,
+          description: 'User changed their password',
+        },
+      })
+      .catch((err) => {
+        this.logger.error(`Failed to audit-log password change: ${err}`);
+      });
+
+    await this.sessionsService.revokeAllSessions(existingUser.id);
+    // #1291 — a password change invalidates remembered devices too.
+    await this.twoFactorService?.revokeAllDevices(existingUser.id);
+
+    return { message: 'Password updated successfully' };
+  }
+
+  async setupTwoFactor(user: AuthUserPayload) {
+    const foundUser = await this.prisma.user.findUnique({
+      where: { id: user.sub },
+    });
+
+    if (!foundUser) {
+      throw new NotFoundException('User not found');
+    }
+
+    const secret = randomBase32Secret();
+    const backupCodes = generateBackupCodes();
+    const hashedBackupCodes = backupCodes.map((code) => createSha256(code));
+    const otpAuthUrl = buildOtpAuthUrl(foundUser.email, secret, this.issuer);
+
+    await this.prisma.user.update({
+      where: { id: foundUser.id },
+      data: {
+        twoFactorSecret: secret,
+        twoFactorEnabled: false,
+        twoFactorBackupCodes: {
+          set: hashedBackupCodes,
+        },
+      },
+    });
+
+    return {
+      secret,
+      otpAuthUrl,
+      qrCodeUrl: buildQrCodeUrl(otpAuthUrl),
+      backupCodes,
+    };
+  }
+
+  async verifyTwoFactor(user: AuthUserPayload, data: VerifyTwoFactorDto) {
+    const foundUser = await this.prisma.user.findUnique({
+      where: { id: user.sub },
+    });
+
+    if (!foundUser?.twoFactorSecret) {
+      throw new BadRequestException('Two-factor authentication has not been initialized');
+    }
+
+    const validCode = verifyTotpCode({
+      secret: foundUser.twoFactorSecret,
+      code: data.code,
+    });
+    if (!validCode) {
+      throw new UnauthorizedException('Invalid two-factor authentication code');
+    }
+
+    await this.prisma.user.update({
+      where: { id: foundUser.id },
+      data: {
+        twoFactorEnabled: true,
+      },
+    });
+
+    // Audit log 2FA enable (#886)
+    await this.prisma.activityLog
+      .create({
+        data: {
+          userId: user.sub,
+          action: 'TWO_FACTOR_ENABLED',
+          entityType: 'USER',
+          entityId: user.sub,
+          description: 'User enabled two-factor authentication',
+        },
+      })
+      .catch((err) => {
+        this.logger.error(`Failed to audit-log 2FA enable: ${err}`);
+      });
+
+    return { message: 'Two-factor authentication enabled successfully' };
+  }
+
+  async disableTwoFactor(user: AuthUserPayload, password: string) {
+    const foundUser = await this.prisma.user.findUnique({
+      where: { id: user.sub },
+    });
+
+    if (!foundUser) {
+      throw new NotFoundException('User not found');
+    }
+
+    const passwordMatches = await comparePassword(password, foundUser.password ?? '');
+    if (!passwordMatches) {
+      throw new UnauthorizedException('Password is incorrect');
+    }
+
+    await this.prisma.user.update({
+      where: { id: foundUser.id },
+      data: {
+        twoFactorEnabled: false,
+        twoFactorSecret: null,
+        twoFactorBackupCodes: {
+          set: [],
+        },
+      },
+    });
+
+    // #1291 — disabling 2FA makes any remembered device meaningless.
+    await this.twoFactorService?.revokeAllDevices(foundUser.id);
+
+    // Audit log 2FA disable (#886)
+    await this.prisma.activityLog
+      .create({
+        data: {
+          userId: user.sub,
+          action: 'TWO_FACTOR_DISABLED',
+          entityType: 'USER',
+          entityId: user.sub,
+          description: 'User disabled two-factor authentication',
+        },
+      })
+      .catch((err) => {
+        this.logger.error(`Failed to audit-log 2FA disable: ${err}`);
+      });
+
+    return { message: 'Two-factor authentication disabled successfully' };
+  }
+
+  // ─── Two-factor management (#1291) ─────────────────────────────────────
+
+  /**
+   * Issue a fresh set of recovery codes. Requires fresh 2FA at the controller
+   * layer (FreshTwoFactorGuard) so possession of the account is proven.
+   */
+  async regenerateRecoveryCodes(user: AuthUserPayload) {
+    if (!this.twoFactorService) {
+      throw new ServiceUnavailableException('Two-factor service unavailable');
+    }
+
+    const foundUser = await this.prisma.user.findUnique({ where: { id: user.sub } });
+    if (!foundUser) {
+      throw new NotFoundException('User not found');
+    }
+    if (!foundUser.twoFactorEnabled) {
+      throw new BadRequestException('Two-factor authentication is not enabled');
+    }
+
+    const recoveryCodes = await this.twoFactorService.regenerateRecoveryCodes(user.sub);
+
+    await this.prisma.activityLog
+      .create({
+        data: {
+          userId: user.sub,
+          action: 'TWO_FACTOR_RECOVERY_CODES_REGENERATED',
+          entityType: 'USER',
+          entityId: user.sub,
+          description: 'User regenerated two-factor recovery codes',
+        },
+      })
+      .catch((err) => {
+        this.logger.error(`Failed to audit-log recovery-code regeneration: ${err}`);
+      });
+
+    return { recoveryCodes };
+  }
+
+  /** List the devices trusted for this user (#1291). */
+  async listTrustedDevices(user: AuthUserPayload) {
+    if (!this.twoFactorService) {
+      return { devices: [] };
+    }
+    const devices = await this.twoFactorService.listDevices(user.sub);
+    return { devices };
+  }
+
+  /** Revoke a single trusted device (#1291). */
+  async revokeTrustedDevice(user: AuthUserPayload, deviceId: string) {
+    if (!this.twoFactorService) {
+      throw new ServiceUnavailableException('Two-factor service unavailable');
+    }
+    return this.twoFactorService.revokeDevice(user.sub, deviceId);
+  }
+
+  /**
+   * Admin-initiated reset of a user's two-factor configuration (#1291). Used
+   * when a user is locked out — it clears the secret, recovery codes and all
+   * trusted devices.
+   */
+  async adminForceDisableTwoFactor(admin: AuthUserPayload, email: string) {
+    const target = await this.prisma.user.findUnique({
+      where: { email: email.trim().toLowerCase() },
+    });
+
+    if (!target) {
+      throw new NotFoundException('User not found');
+    }
+
+    await this.prisma.user.update({
+      where: { id: target.id },
+      data: {
+        twoFactorEnabled: false,
+        twoFactorSecret: null,
+        twoFactorBackupCodes: { set: [] },
+      },
+    });
+
+    await this.twoFactorService?.revokeAllDevices(target.id);
+
+    await this.prisma.activityLog
+      .create({
+        data: {
+          userId: target.id,
+          action: 'TWO_FACTOR_ADMIN_FORCE_DISABLED',
+          entityType: 'USER',
+          entityId: target.id,
+          description: `Two-factor authentication force-disabled by admin ${admin.sub}`,
+          metadata: { adminId: admin.sub },
+        },
+      })
+      .catch((err) => {
+        this.logger.error(`Failed to audit-log admin 2FA reset: ${err}`);
+      });
+
+    return { message: 'Two-factor authentication has been reset', userId: target.id };
+  }
+
+  async createApiKey(user: AuthUserPayload, data: CreateApiKeyDto) {
+    const apiKeyValue = this.generateApiKeyValue();
+    const permissions = this.normalizePermissions(data.permissions);
+    const record = await this.prisma.apiKey.create({
+      data: {
+        userId: user.sub,
+        name: data.name,
+        keyPrefix: apiKeyValue.slice(0, 12),
+        keyHash: createSha256(apiKeyValue),
+        permissions,
+        monthlyQuota: data.monthlyQuota ?? null,
+        expiresAt: data.expiresAt ? new Date(data.expiresAt) : null,
+      },
+    });
+
+    return {
+      apiKey: apiKeyValue,
+      details: this.toApiKeyResponse(record),
+    };
+  }
+
+  /**
+   * Lists the caller's API keys. Without `page`/`limit` the full array is
+   * returned as before (existing clients keep working); with either, the result
+   * is `{ data, meta }`, newest first, with `limit` capped at 100.
+   */
+  async listApiKeys(user: AuthUserPayload, query: AuthPaginationQueryDto = {}) {
+    const where = { userId: user.sub };
+    if (query.page === undefined && query.limit === undefined) {
+      const apiKeys = await this.prisma.apiKey.findMany({ where, orderBy: { createdAt: 'desc' } });
+      return apiKeys.map((apiKey: ApiKey) => this.toApiKeyResponse(apiKey));
+    }
+
+    const page = query.page ?? 1;
+    const limit = query.limit ?? AUTH_DEFAULT_PAGE_SIZE;
+    const [apiKeys, total] = await Promise.all([
+      this.prisma.apiKey.findMany({
+        where,
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+        skip: (page - 1) * limit,
+        take: limit,
+      }),
+      this.prisma.apiKey.count({ where }),
+    ]);
+    return {
+      data: apiKeys.map((apiKey: ApiKey) => this.toApiKeyResponse(apiKey)),
+      meta: buildPageMeta(page, limit, total),
+    };
+  }
+
+  async rotateApiKey(user: AuthUserPayload, apiKeyId: string) {
+    const apiKey = await this.prisma.apiKey.findFirst({
+      where: {
+        id: apiKeyId,
+        userId: user.sub,
+      },
+    });
+
+    if (!apiKey) {
+      throw new NotFoundException('API key not found');
+    }
+
+    await this.prisma.apiKey.update({
+      where: { id: apiKey.id },
+      data: {
+        revokedAt: new Date(),
+      },
+    });
+
+    return this.createApiKey(user, {
+      name: apiKey.name,
+      permissions: apiKey.permissions,
+      expiresAt: apiKey.expiresAt?.toISOString(),
+    });
+  }
+
+  async revokeApiKey(user: AuthUserPayload, apiKeyId: string) {
+    const apiKey = await this.prisma.apiKey.findFirst({
+      where: {
+        id: apiKeyId,
+        userId: user.sub,
+      },
+    });
+
+    if (!apiKey) {
+      throw new NotFoundException('API key not found');
+    }
+
+    await this.prisma.apiKey.update({
+      where: { id: apiKey.id },
+      data: {
+        revokedAt: new Date(),
+      },
+    });
+
+    return { message: 'API key revoked successfully' };
+  }
+
+  async googleOAuthLogin(profile: GoogleProfile) {
+    let user = await this.prisma.user.findUnique({ where: { googleId: profile.googleId } });
+
+    if (!user) {
+      // Try to link to an existing account by email
+      user = await this.prisma.user.findUnique({ where: { email: profile.email } });
+
+      if (user) {
+        // Link Google account to existing user
+        user = await this.prisma.user.update({
+          where: { id: user.id },
+          data: {
+            googleId: profile.googleId,
+            avatar: user.avatar ?? profile.avatar,
+          },
+        });
+      } else {
+        // Create new user from Google profile
+        user = await this.prisma.user.create({
+          data: {
+            email: profile.email,
+            googleId: profile.googleId,
+            firstName: profile.firstName,
+            lastName: profile.lastName,
+            avatar: profile.avatar,
+            isVerified: true,
+          },
+        });
+        userRegistrationsTotal.inc({ method: 'google' });
+      }
+    } else {
+      // Sync profile fields
+      user = await this.prisma.user.update({
+        where: { id: user.id },
+        data: {
+          firstName: profile.firstName,
+          lastName: profile.lastName,
+          avatar: user.avatar ?? profile.avatar,
+        },
+      });
+    }
+
+    const tokens = await this.issueTokenPair(user);
+    userLoginsTotal.inc({ method: 'google' });
+    return { user: sanitizeUser(user), ...tokens };
+  }
+
+  async updateApiKeyPermissions(
+    user: AuthUserPayload,
+    apiKeyId: string,
+    data: UpdateApiKeyPermissionsDto,
+  ) {
+    const apiKey = await this.prisma.apiKey.findFirst({
+      where: {
+        id: apiKeyId,
+        userId: user.sub,
+      },
+    });
+
+    if (!apiKey) {
+      throw new NotFoundException('API key not found');
+    }
+
+    const updated = await this.prisma.apiKey.update({
+      where: { id: apiKey.id },
+      data: {
+        permissions: this.normalizePermissions(data.permissions),
+      },
+    });
+
+    return this.toApiKeyResponse(updated);
+  }
+
+  async getApiKeyUsage(user: AuthUserPayload, apiKeyId: string) {
+    const apiKey = await this.prisma.apiKey.findFirst({
+      where: {
+        id: apiKeyId,
+        userId: user.sub,
+      },
+      select: {
+        id: true,
+        name: true,
+        keyPrefix: true,
+        usageCount: true,
+        lastUsedAt: true,
+        revokedAt: true,
+        expiresAt: true,
+        createdAt: true,
+      },
+    });
+
+    if (!apiKey) {
+      throw new NotFoundException('API key not found');
+    }
+
+    return apiKey;
+  }
+
+  async validateAccessToken(token: string): Promise<AuthUserPayload> {
+    const payload = this.verifyToken(token, this.jwtSecret) as JwtPayload;
+
+    if (payload.type !== 'access') {
+      throw new UnauthorizedException('Invalid access token');
+    }
+
+    await this.ensureTokenNotBlacklisted(payload.jti);
+    const user = await this.prisma.user.findUnique({
+      where: { id: payload.sub },
+      select: {
+        email: true,
+        role: true,
+        tier: true,
+        lastActivityAt: true,
+      },
+    });
+
+    if (!user) {
+      throw new UnauthorizedException('User no longer exists');
+    }
+
+    const now = new Date();
+    if (!user.lastActivityAt || now.getTime() - user.lastActivityAt.getTime() > 5 * 60 * 1000) {
+      this.prisma.user
+        .update({
+          where: { id: payload.sub },
+          data: { lastActivityAt: now },
+        })
+        .catch((err: unknown) =>
+          this.logger.error(
+            `Failed to update lastActivityAt: ${
+              err instanceof Error ? err.message : JSON.stringify(err)
+            }`,
+          ),
+        );
+    }
+
+    return {
+      sub: payload.sub,
+      email: user.email,
+      role: user.role,
+      tier: user.tier,
+      type: 'access',
+      jti: payload.jti,
+    };
+  }
+
+  async validateApiKey(apiKeyValue: string): Promise<AuthUserPayload> {
+    const apiKey = await this.prisma.apiKey.findUnique({
+      where: {
+        keyHash: createSha256(apiKeyValue),
+      },
+      include: {
+        user: true,
+      },
+    });
+
+    if (!apiKey || apiKey.revokedAt || (apiKey.expiresAt && apiKey.expiresAt < new Date())) {
+      throw new UnauthorizedException('Invalid API key');
+    }
+
+    if (apiKey.user.isBlocked) {
+      throw new UnauthorizedException('User account is blocked');
+    }
+
+    await this.apiKeyAnalyticsService?.checkQuota(apiKey.id);
+
+    await this.prisma.apiKey.update({
+      where: { id: apiKey.id },
+      data: {
+        lastUsedAt: new Date(),
+        usageCount: {
+          increment: 1,
+        },
+      },
+    });
+
+    await this.apiKeyAnalyticsService?.recordUsage(apiKey.id).catch((err: unknown) => {
+      this.logger.error(`Failed to record API key usage: ${(err as Error).message}`);
+    });
+
+    userLoginsTotal.inc({ method: 'api-key' });
+
+    return {
+      sub: apiKey.userId,
+      email: apiKey.user.email,
+      role: apiKey.user.role as UserRole,
+      tier: apiKey.user.tier as UserTier,
+      type: 'api-key',
+      apiKeyId: apiKey.id,
+      apiKeyPermissions: apiKey.permissions,
+    };
+  }
+
+  async issueTokenPair(
+    user: { id: string; email: string; role: string; tier: string },
+    tokenFamily?: string,
+    ipAddress?: string,
+    userAgent?: string,
+  ) {
+    const accessJti = randomUUID();
+    const refreshJti = randomUUID();
+    const family = tokenFamily || randomUUID(); // Create new family if not provided
+
+    const accessToken = this.signToken(
+      {
+        sub: user.id,
+        email: user.email,
+        role: user.role as UserRole,
+        tier: user.tier as UserTier,
+        type: 'access',
+        jti: accessJti,
+        family: family,
+      },
+      this.jwtSecret,
+      this.accessTokenTtlSeconds,
+    );
+
+    const refreshToken = this.signToken(
+      {
+        sub: user.id,
+        email: user.email,
+        role: user.role as UserRole,
+        tier: user.tier as UserTier,
+        type: 'refresh',
+        jti: refreshJti,
+        family: family,
+      },
+      this.jwtRefreshSecret,
+      this.refreshTokenTtlSeconds,
+    );
+
+    // Create a session for tracking
+    await this.sessionsService.createSession(
+      user.id,
+      accessJti,
+      refreshJti,
+      ipAddress,
+      userAgent,
+      this.refreshTokenTtlSeconds,
+    );
+
+    return {
+      accessToken,
+      refreshToken,
+      accessTokenExpiresIn: this.accessTokenTtlSeconds,
+      refreshTokenExpiresIn: this.refreshTokenTtlSeconds,
+    };
+  }
+
+  private signToken(payload: JwtPayload, secret: string, expiresInSeconds: number) {
+    return jwt.sign(payload, secret, {
+      expiresIn: expiresInSeconds,
+      issuer: this.issuer,
+    });
+  }
+
+  private verifyToken(token: string, secret: string) {
+    try {
+      return jwt.verify(token, secret, {
+        issuer: this.issuer,
+      }) as JwtPayload & { exp?: number };
+    } catch {
+      throw new UnauthorizedException('Invalid or expired token');
+    }
+  }
+
+  private async ensureTokenNotBlacklisted(jti: string) {
+    const blacklistedToken = await this.prisma.blacklistedToken.findUnique({
+      where: { jti },
+    });
+
+    if (blacklistedToken) {
+      throw new UnauthorizedException('Token has been revoked');
+    }
+  }
+
+  private async blacklistToken(data: {
+    jti: string;
+    tokenType: 'ACCESS' | 'REFRESH';
+    expiresAt: Date;
+    userId?: string;
+    tokenFamily?: string;
+    previousJti?: string;
+    ipAddress?: string;
+    userAgent?: string;
+  }) {
+    await this.prisma.blacklistedToken.upsert({
+      where: { jti: data.jti },
+      update: {
+        expiresAt: data.expiresAt,
+        tokenType: data.tokenType,
+        userId: data.userId,
+        tokenFamily: data.tokenFamily,
+        previousJti: data.previousJti,
+        ipAddress: data.ipAddress,
+        userAgent: data.userAgent,
+      },
+      create: {
+        jti: data.jti,
+        tokenType: data.tokenType,
+        expiresAt: data.expiresAt,
+        userId: data.userId,
+        tokenFamily: data.tokenFamily,
+        previousJti: data.previousJti,
+        ipAddress: data.ipAddress,
+        userAgent: data.userAgent,
+      },
+    });
+  }
+
+  /**
+   * Generate an API key value in the format `pc_<48-hex-chars>`.
+   *
+   * - Prefix `pc_` identifies PropChain-issued keys (51 chars total).
+   * - The 24-byte random payload provides 192 bits of entropy via
+   *   `crypto.randomBytes` (hex-encoded, 48 characters).
+   * - Keys are stored hashed (SHA-256) in the database; the raw value
+   *   is shown to the user only once at creation time.
+   */
+  private generateApiKeyValue() {
+    return `pc_${randomToken(24)}`;
+  }
+
+  private toApiKeyResponse(apiKey: ApiKey) {
+    return {
+      id: apiKey.id,
+      name: apiKey.name,
+      keyPrefix: apiKey.keyPrefix,
+      permissions: apiKey.permissions,
+      usageCount: apiKey.usageCount,
+      monthlyQuota: apiKey.monthlyQuota,
+      lastUsedAt: apiKey.lastUsedAt,
+      expiresAt: apiKey.expiresAt,
+      revokedAt: apiKey.revokedAt,
+      createdAt: apiKey.createdAt,
+      updatedAt: apiKey.updatedAt,
+    };
+  }
+
+  private normalizePermissions(permissions?: string[]) {
+    if (!permissions || permissions.length === 0) {
+      return [];
+    }
+
+    return Array.from(new Set(permissions.map((permission) => permission.trim()).filter(Boolean)));
+  }
+
+  async requestPasswordReset(data: RequestPasswordResetDto): Promise<void> {
+    const user = await this.usersService.findByEmail(data.email);
+    if (!user) {
+      // Don't reveal if email exists or not for security
       return;
     }
 
-    const requestFingerprint = this.buildFingerprint(requestMeta);
-    if (requestFingerprint !== session.fingerprint) {
-      throw new UnauthorizedException('Session validation failed');
+    if (user.isBlocked) {
+      // Don't send reset emails to blocked users
+      return;
     }
+
+    // Invalidate any existing reset tokens for this user
+    await this.prisma.passwordResetToken.updateMany({
+      where: {
+        userId: user.id,
+        usedAt: null,
+        expiresAt: { gt: new Date() },
+      },
+      data: {
+        expiresAt: new Date(), // Expire immediately
+      },
+    });
+
+    // Generate new reset token
+    const resetToken = randomToken(32);
+    const tokenHash = createSha256(resetToken);
+    const expiresAt = new Date(Date.now() + 60 * 60 * 1000); // 1 hour
+
+    await this.prisma.passwordResetToken.create({
+      data: {
+        userId: user.id,
+        token: tokenHash,
+        expiresAt,
+      },
+    });
+
+    // Send reset email with raw token (not the hash)
+    // Retried with backoff: a transient mail-provider failure should not lose the reset email.
+    await retryWithBackoff(() => this.emailService.sendPasswordResetEmail(user.email, resetToken), {
+      attempts: 3,
+      baseDelayMs: 300,
+      maxDelayMs: 2_000,
+    });
+  }
+
+  async resetPassword(data: ResetPasswordDto): Promise<void> {
+    const tokenHash = createSha256(data.token);
+    const resetToken = await this.prisma.passwordResetToken.findUnique({
+      where: { token: tokenHash },
+      include: { user: true },
+    });
+
+    if (!resetToken) {
+      throw new BadRequestException('Invalid or expired reset token');
+    }
+
+    if (resetToken.usedAt) {
+      throw new BadRequestException('Reset token has already been used');
+    }
+
+    if (resetToken.expiresAt < new Date()) {
+      throw new BadRequestException('Reset token has expired');
+    }
+
+    if (resetToken.user.isBlocked) {
+      throw new BadRequestException('Account is blocked');
+    }
+
+    const passwordHistoryLimit = this.getPasswordHistoryLimit();
+
+    this.assertPasswordMeetsPolicy(data.newPassword);
+
+    // Check if new password was used recently
+    const recentPasswords = await this.prisma.passwordHistory.findMany({
+      where: { userId: resetToken.userId },
+      orderBy: { createdAt: 'desc' },
+      take: passwordHistoryLimit,
+    });
+    await this.assertPasswordNotReused(
+      data.newPassword,
+      recentPasswords.map((entry) => entry.passwordHash),
+      passwordHistoryLimit,
+    );
+
+    const newPasswordHash = await hashPassword(data.newPassword, this.bcryptRounds);
+
+    // Update password and mark token as used in a transaction
+    await this.prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+      await tx.user.update({
+        where: { id: resetToken.userId },
+        data: { password: newPasswordHash },
+      });
+
+      await tx.passwordResetToken.update({
+        where: { id: resetToken.id },
+        data: { usedAt: new Date() },
+      });
+
+      await this.recordPasswordHistory(
+        tx,
+        resetToken.userId,
+        newPasswordHash,
+        passwordHistoryLimit,
+      );
+    });
+
+    await this.sessionsService.revokeAllSessions(resetToken.userId);
+  }
+
+  async unlockAccount(email: string) {
+    await this.rateLimitService.unlockAccount(email);
+    return { message: 'Account unlocked successfully. You can now try to log in again.' };
+  }
+
+  async getLoginStatus(email: string) {
+    const lockoutInfo = await this.rateLimitService.getLockoutInfo(email);
+
+    if (!lockoutInfo) {
+      return {
+        email,
+        isLocked: false,
+        failedAttempts: 0,
+        canAttemptLogin: true,
+      };
+    }
+
+    return {
+      email,
+      isLocked: lockoutInfo.isLocked,
+      failedAttempts: lockoutInfo.failedAttempts,
+      unlockAt: lockoutInfo.unlockAt,
+      remainingLockoutMinutes: lockoutInfo.remainingLockoutMinutes,
+      canAttemptLogin: !lockoutInfo.isLocked,
+    };
+  }
+
+  private async recordLoginHistory(userId: string, ipAddress?: string, userAgent?: string) {
+    await this.prisma.loginHistory.create({
+      data: {
+        userId,
+        ipAddress,
+        userAgent,
+      },
+    });
+  }
+
+  private getPasswordHistoryLimit(): number {
+    const parsed = Number(this.configService.get('PASSWORD_HISTORY_LIMIT') ?? 5);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : 5;
+  }
+
+  private async verifyCaptcha(token: string): Promise<boolean> {
+    const secret = this.configService.get<string>('RECAPTCHA_SECRET');
+    const bypass = this.configService.get<string>('CAPTCHA_BYPASS') === 'true';
+
+    if (bypass) {
+      this.logger.warn(
+        'CAPTCHA bypass is enabled via CAPTCHA_BYPASS=true. This should only be used in development.',
+      );
+      return true;
+    }
+
+    if (!secret) {
+      // Defensive: boot-time validation catches this in validateEnvironment().
+      // At request time we must never surface a bare 500 for a configuration
+      // problem – return a stable 503 instead.
+      throw new ServiceUnavailableException(
+        'CAPTCHA verification is temporarily unavailable.',
+        'CAPTCHA_SERVICE_UNAVAILABLE',
+      );
+    }
+
+    try {
+      // Retried with backoff on network errors, 429 and 5xx; other responses are final.
+      const response = await retryWithBackoff(
+        async () => {
+          const res = await fetch('https://www.google.com/recaptcha/api/siteverify', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/x-www-form-urlencoded',
+            },
+            body: `secret=${secret}&response=${token}`,
+          });
+          if (res.status === 429 || res.status >= 500) {
+            throw new TransientError(`reCAPTCHA responded ${res.status}`);
+          }
+          return res;
+        },
+        { attempts: 3, baseDelayMs: 200, maxDelayMs: 1_500 },
+      );
+
+      const data = (await response.json()) as RecaptchaVerifyResponse;
+
+      // reCAPTCHA v3 returns a score between 0.0 and 1.0. Typically, 0.5 is a good threshold.
+      if (data.success && data.score !== undefined && data.score >= 0.5) {
+        return true;
+      }
+
+      if (data.success && data.score === undefined) {
+        // v2 fallback
+        return true;
+      }
+
+      this.logger.warn('CAPTCHA verification failed', {
+        event: 'auth.captcha_failed',
+        errorCodes: data['error-codes'] ?? [],
+      });
+      return false;
+    } catch (error: unknown) {
+      this.logger.error('Error verifying CAPTCHA', {
+        event: 'auth.captcha_error',
+        error: (error as Error).message,
+      });
+      return false;
+    }
+  }
+
+  async verifyInitialEmail(token: string, ipAddress?: string, userAgent?: string) {
+    // Find user by verification token
+    const user = await this.prisma.user.findFirst({
+      where: {
+        emailVerificationToken: token,
+      },
+    });
+
+    if (!user) {
+      throw new BadRequestException('Invalid or expired verification token');
+    }
+
+    // Check if token is expired
+    if (!user.emailVerificationExpires || new Date() > user.emailVerificationExpires) {
+      // Clear expired token
+      await this.prisma.user.update({
+        where: { id: user.id },
+        data: {
+          emailVerificationToken: null,
+          emailVerificationExpires: null,
+        },
+      });
+      throw new BadRequestException('Verification token has expired');
+    }
+
+    // Verify user not already verified
+    if (user.isVerified) {
+      throw new BadRequestException('Email already verified');
+    }
+
+    // Update user to isVerified and clear verification fields
+    const updatedUser = await this.prisma.user.update({
+      where: { id: user.id },
+      data: {
+        isVerified: true,
+        emailVerificationToken: null,
+        emailVerificationExpires: null,
+      },
+    });
+
+    // Issue token pair
+    const tokens = await this.issueTokenPair(updatedUser, undefined, ipAddress, userAgent);
+
+    return {
+      message: 'Email verified successfully',
+      user: sanitizeUser(updatedUser),
+      ...tokens,
+    };
+  }
+
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  async resendEmailVerification(email: string, ipAddress?: string, userAgent?: string) {
+    const user = await this.usersService.findByEmail(email);
+    if (!user) {
+      return;
+    }
+
+    if (user.isBlocked) {
+      return;
+    }
+
+    if (user.isVerified) {
+      throw new BadRequestException('Email already verified');
+    }
+
+    const verificationToken = randomToken(32);
+    const verificationExpiresAt = new Date(
+      Date.now() +
+        parseDuration(
+          this.configService.get<string>('EMAIL_VERIFICATION_EXPIRES_IN') ?? '24h',
+          24 * 60 * 60,
+        ) *
+          1000,
+    );
+
+    await this.prisma.user.update({
+      where: { id: user.id },
+      data: {
+        emailVerificationToken: verificationToken,
+        emailVerificationExpires: verificationExpiresAt,
+      },
+    });
+
+    await this.emailService
+      .sendEmail({
+        to: user.email,
+        subject: 'Verify your email - PropChain',
+        template: 'email-verification',
+        context: { token: verificationToken },
+        userId: user.id,
+        emailType: 'email_verification',
+      })
+      .catch((err) => {
+        this.logger.error('Failed to queue verification email:', err?.message || err);
+      });
+
+    this.logger.log('Verification email resent', {
+      event: 'auth.verification_resent',
+      userId: user.id,
+    });
   }
 }

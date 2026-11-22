@@ -1,0 +1,112 @@
+{
+  "common": {
+    "validation_failed": "Error de validación",
+    "unexpected_error": "Se produjo un error inesperado",
+    "internal_server_error": "Error interno del servidor",
+    "bad_request": "Solicitud inválida",
+    "unauthorized": "No autorizado",
+    "forbidden": "Acceso denegado",
+    "not_found": "Recurso no encontrado",
+    "conflict": "Conflicto con el recurso",
+    "rate_limited": "Demasiadas solicitudes. Inténtalo de nuevo más tarde.",
+    "service_unavailable": "Servicio no disponible. Inténtalo de nuevo más tarde."
+  },
+  "validation": {
+    "required": "{field} es obligatorio",
+    "email_invalid": "{field} debe ser una dirección de correo válida",
+    "min_length": "{field} debe tener al menos {min} caracteres",
+    "max_length": "{field} debe tener como máximo {max} caracteres",
+    "must_be_string": "{field} debe ser una cadena de texto",
+    "must_be_number": "{field} debe ser un número",
+    "must_be_int": "{field} debe ser un número entero",
+    "must_be_boolean": "{field} debe ser un valor booleano",
+    "must_be_uuid": "{field} debe ser un UUID",
+    "must_be_enum": "{field} debe ser uno de: {options}",
+    "must_be_date": "{field} debe ser una fecha válida",
+    "is_in": "{field} debe ser uno de: {options}",
+    "is_not_in": "{field} no debe ser uno de: {options}",
+    "matches": "El formato de {field} es inválido"
+  },
+  "auth": {
+    "invalid_credentials": "Correo o contraseña inválidos",
+    "account_locked": "Tu cuenta está bloqueada temporalmente. Inténtalo más tarde.",
+    "account_blocked": "Tu cuenta ha sido bloqueada. Contacta con soporte.",
+    "email_not_verified": "Verifica tu correo electrónico antes de continuar.",
+    "two_factor_required": "Se requiere un código de autenticación de dos factores."
+  },
+  "users": {
+    "not_found": "Usuario no encontrado",
+    "email_taken": "Este correo ya está en uso",
+    "self_deletion_blocked_by_legal_hold": "Tu cuenta tiene una retención legal y no puede ser eliminada en este momento.",
+    "self_deletion_already_requested": "Ya hay una eliminación de cuenta programada.",
+    "self_deletion_not_requested": "No hay solicitud de eliminación activa para cancelar.",
+    "self_deletion_already_permanent": "La cuenta ya fue eliminada permanentemente.",
+    "self_deletion_retention_too_short": "El período de retención no puede ser menor a {min} días.",
+    "self_deletion_retention_too_long": "El período de retención no puede exceder {max} días."
+  },
+  "properties": {
+    "not_found": "Propiedad no encontrada",
+    "duplicate": "Se detectó un anuncio duplicado"
+  },
+  "transactions": {
+    "not_found": "Transacción no encontrada",
+    "invalid_state": "La transacción no puede pasar de {from} a {to}"
+  },
+  "documents": {
+    "not_found": "Documento no encontrado",
+    "expired": "Este documento ha caducado."
+  },
+  "fraud": {
+    "alert_created_subject": "Alerta de seguridad: {title}"
+  },
+  "http": {
+    "400": "La solicitud está mal formada o es inválida.",
+    "401": "Se requiere autenticación.",
+    "403": "No tienes permiso para realizar esta acción.",
+    "404": "No se encontró el recurso solicitado.",
+    "409": "La solicitud entra en conflicto con el estado actual del recurso.",
+    "422": "Los datos enviados no superaron la validación.",
+    "429": "Demasiadas solicitudes. Por favor reduce la velocidad.",
+    "500": "Error interno del servidor.",
+    "503": "Servicio temporalmente no disponible."
+  },
+  "prisma": {
+    "P2002": "Ya existe un registro con ese valor.",
+    "P2003": "Esta acción referencia un registro que no existe.",
+    "P2011": "Falta un campo obligatorio.",
+    "P2014": "Esta acción viola una relación existente.",
+    "P2025": "No se pudo encontrar el registro.",
+    "P2000": "Uno de los valores proporcionados es demasiado largo."
+  },
+  "email": {
+    "password_reset_subject": "Restablecimiento de contraseña - PropChain",
+    "password_reset_title": "Solicitud de restablecimiento de contraseña",
+    "password_reset_body": "Ha solicitado restablecer la contraseña de su cuenta de PropChain.",
+    "password_reset_cta": "Restablecer contraseña",
+    "password_reset_ignore": "Si no solicitó este restablecimiento, ignore este correo.",
+    "password_reset_expiry": "Este enlace caducará en 1 hora por motivos de seguridad.",
+    "account_locked_subject": "Cuenta bloqueada - PropChain",
+    "account_locked_title": "Cuenta bloqueada",
+    "account_locked_body": "Su cuenta de PropChain ha sido bloqueada temporalmente debido a múltiples intentos fallidos de inicio de sesión.",
+    "account_locked_duration": "El bloqueo expirará automáticamente en {lockoutDuration} minutos.",
+    "account_locked_advice": "Si no intentó iniciar sesión, restablezca su contraseña de inmediato o contacte con soporte.",
+    "fraud_alert_subject": "[Alerta de fraude][{severity}] {title}",
+    "fraud_alert_title": "Alerta de fraude activada",
+    "fraud_alert_summary": "Resumen",
+    "transaction_status_subject": "[PropChain] Transacción {status}",
+    "transaction_pending_title": "Transacción pendiente",
+    "transaction_pending_body": "Su transacción está pendiente. Le notificaremos de cualquier actualización.",
+    "transaction_completed_title": "Transacción completada",
+    "transaction_completed_body": "Su transacción se ha completado correctamente.",
+    "transaction_cancelled_title": "Transacción cancelada",
+    "transaction_cancelled_body": "Su transacción ha sido cancelada.",
+    "data_export_ready_subject": "Su exportación de datos de PropChain está lista",
+    "data_export_ready_greeting": "Hola {name},",
+    "data_export_ready_body": "Su exportación de datos personales está lista. Use el enlace siguiente para descargar el archivo. ID del trabajo: {jobId}",
+    "data_export_ready_security": "Por su seguridad, esta descarga es de un solo uso y caduca en breve.",
+    "data_export_failed_subject": "Falló la exportación de datos de PropChain",
+    "data_export_failed_body": "No pudimos completar su exportación de datos (ID del trabajo: {jobId}). Inténtelo de nuevo o contacte con soporte.",
+    "regards": "Atentamente,",
+    "team": "El equipo de PropChain"
+  }
+}

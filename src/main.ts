@@ -1,183 +1,218 @@
 import { NestFactory } from '@nestjs/core';
-import { ValidationPipe } from '@nestjs/common';
-import { SwaggerModule, DocumentBuilder } from '@nestjs/swagger';
-import { ConfigService } from '@nestjs/config';
-import helmet from 'helmet';
-import { compressionMiddleware } from './middleware/compression.middleware';
+import { ValidationPipe, BadRequestException } from '@nestjs/common';
+import { Reflector } from '@nestjs/core';
+import { NestExpressApplication } from '@nestjs/platform-express';
 import { AppModule } from './app.module';
-import { StructuredLoggerService } from './common/logging/logger.service';
-import { ErrorResponseDto } from './common/errors/error.dto';
-import { SecurityHeadersService } from './security/services/security-headers.service';
-import { CorsValidationService } from './security/services/cors-validation.service';
-import { DEFAULT_API_VERSION } from './common/api-version';
-import { ValidationExceptionFilter } from './common/filters/validation-exception.filter';
-import { CorsOriginValidator } from './config/utils/cors-origin.validator';
-import { DataSource } from 'typeorm';
-import { connectWithRetry } from './database/retry-connection';
+import { VersionHeaderInterceptor } from './versioning/version-header.interceptor';
+import { DeprecationWarningInterceptor } from './versioning/deprecation-warning.interceptor';
+import { CacheMetricsInterceptor } from './cache/cache-metrics.interceptor';
+import { RateLimitGuard } from './auth/guards/rate-limit.guard';
+import { RateLimitService } from './auth/rate-limit.service';
+import { RateLimitHeadersInterceptor } from './auth/interceptors/rate-limit-headers.interceptor';
+import { ResponseFormatInterceptor } from './common/interceptors/response-format.interceptor';
+import { setupSwagger, setupOpenAPIEndpoint } from './config/swagger.config';
+import { createSecurityHeadersMiddleware } from './config/security-headers';
+import { validateEnvironment } from './utils/validate-env';
+// Issue #914 – Structured JSON logging in production, pretty-print in dev
+import { AppLogger } from './common/logger';
+import { TraceInterceptor } from './tracing/trace.interceptor';
+// Issue #964 – exception filters are registered globally via APP_FILTER
+// providers in AppModule. We deliberately do NOT call useGlobalFilters here
+// to avoid registering the same filter twice.
 
 async function bootstrap() {
-  const app = await NestFactory.create(AppModule, {
-    bufferLogs: true,
+  validateEnvironment();
+
+  // Issue #914 – use structured AppLogger as NestJS application logger.
+  // JSON output in production; pretty-print in development.
+  const logger = new AppLogger('Bootstrap');
+
+  // Node.js version check (#775, #754 NestJS 11 requires Node 20+)
+  const REQUIRED_NODE_MAJOR = 20;
+  const nodeMajor = parseInt(process.versions.node.split('.')[0], 10);
+
+  if (Number.isNaN(nodeMajor) || nodeMajor < REQUIRED_NODE_MAJOR) {
+    logger.error(
+      `Node.js >= ${REQUIRED_NODE_MAJOR} required, found ${process.versions.node}. ` +
+        `Please upgrade Node.js (see https://nodejs.org/).`,
+    );
+    process.exit(1);
+  }
+
+  const app = await NestFactory.create<NestExpressApplication>(AppModule, {
+    // Issue #914 – replace NestJS default ConsoleLogger with our structured logger
+    logger: new AppLogger('NestApplication'),
   });
 
-  const configService = app.get(ConfigService);
-  const logger = await app.resolve(StructuredLoggerService);
-  app.useLogger(logger);
-
-  // Security middleware
-  app.use(helmet());
-  app.use(compressionMiddleware(configService));
-
-  // Enhanced security headers
-  const securityHeadersService = app.get(SecurityHeadersService);
-  const nodeEnv = configService.get('NODE_ENV', 'development');
-  const isProduction = nodeEnv === 'production';
-  const securityConfig = isProduction
-    ? undefined
-    : securityHeadersService.getDevelopmentConfig();
-
-  // Environment validation
-  const { EnvValidator } = await import('./config/utils/env.validator');
-  EnvValidator.initialize(configService);
-  const validation = EnvValidator.validateOnStartup();
-
-  if (!validation.isValid) {
-    logger.error('❌ Configuration validation failed:', validation.errors.join('\n'), {});
-    if (isProduction) {
-      logger.error('Critical configuration missing. Shutting down.', '', {});
-      process.exit(1);
-    }
+  // Issue #1195 – only trust forwarded headers behind a configured reverse
+  // proxy. Without this, RateLimitGuard ignores x-forwarded-for entirely so a
+  // spoofed header cannot rotate the per-IP rate-limit buckets.
+  const trustProxy = process.env.TRUST_PROXY;
+  if (trustProxy) {
+    app.set('trust proxy', trustProxy);
   } else {
-    logger.log('✅ Configuration validation passed');
+    app.set('trust proxy', false);
   }
-
-  // Security config warnings
-  if (isProduction) {
-    const configErrors = securityHeadersService.validateConfig(securityHeadersService['defaultConfig']);
-    if (configErrors.length > 0) {
-      logger.warn(`Security configuration warnings: ${configErrors.join(', ')}`);
-    }
-  }
-
-  // Apply security headers
-  const securityHeaders = securityHeadersService.getSecurityHeaders(securityConfig);
-  app.use((req: any, res: any, next: () => void) => {
-    Object.entries(securityHeaders).forEach(([key, value]) => {
-      res.setHeader(key, value);
-    });
-    next();
-  });
-  logger.log(`Security headers configured: ${Object.keys(securityHeaders).length} headers applied`);
 
   // CORS configuration
-  const corsValidationService = app.get(CorsValidationService);
-  const corsValidation = corsValidationService.validateConfig();
-  if (!corsValidation.isValid) {
-    logger.error(`Invalid CORS configuration detected: ${corsValidation.errors.join(', ')}`);
-    if (isProduction || nodeEnv === 'staging') {
-      process.exit(1);
-    }
+  const corsOrigins = process.env.CORS_ORIGINS
+    ? process.env.CORS_ORIGINS.split(',').map((origin) => origin.trim())
+    : ['http://localhost:3000'];
+
+  const isProduction = process.env.NODE_ENV === 'production';
+
+  if (isProduction && corsOrigins.includes('*')) {
+    logger.warn('Wildcard CORS origins are not allowed in production. Using default origins.');
+    corsOrigins.length = 0;
+    corsOrigins.push('http://localhost:3000');
   }
 
-  app.enableCors(corsValidationService.getNestCorsOptions());
-  const corsConfig = corsValidationService.getCorsConfig();
-  logger.log(
-    `CORS configured for ${corsConfig.allowedOrigins.length} origin rule(s); credentials=${String(corsConfig.allowCredentials)}`,
+  app.enableCors({
+    origin: corsOrigins,
+    methods: 'GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS',
+    credentials: true,
+    allowedHeaders: ['Content-Type', 'Authorization', 'API-Version', 'api-key', 'x-api-key'],
+  });
+
+  // Security headers middleware (CSP is relaxed only for the Swagger UI route)
+  app.use(createSecurityHeadersMiddleware());
+
+  // Issue #964 / #1234 – Localize validation messages using the request's
+  // Accept-Language (and optional user preference) captured by middleware
+  // into AsyncLocalStorage. exceptionFactory has no Request; the store bridges it.
+  const { I18nService } = await import('./i18n/i18n.service');
+  const { getRequestLanguageContext, runWithRequestLanguage } =
+    await import('./common/request-language.store');
+  const i18n = app.get(I18nService);
+
+  app.use(
+    (
+      req: {
+        headers: Record<string, string | string[] | undefined>;
+        user?: { languagePreference?: string | null };
+      },
+      _res: unknown,
+      next: () => void,
+    ) => {
+      const accept =
+        typeof req.headers['accept-language'] === 'string'
+          ? req.headers['accept-language']
+          : undefined;
+      const xLang =
+        typeof req.headers['x-language'] === 'string' ? req.headers['x-language'] : undefined;
+      runWithRequestLanguage(
+        {
+          acceptLanguageHeader: accept ?? null,
+          userPreference: req.user?.languagePreference ?? xLang ?? null,
+        },
+        () => next(),
+      );
+    },
   );
 
-  // Global pipes
   app.useGlobalPipes(
     new ValidationPipe({
       whitelist: true,
-      forbidNonWhitelisted: true,
-      forbidUnknownValues: true,
-      validateCustomDecorators: true,
       transform: true,
-      transformOptions: { enableImplicitConversion: true },
+      forbidNonWhitelisted: true,
+      exceptionFactory: (errors) => {
+        const messages = (errors ?? []).flatMap((err) =>
+          Object.values((err as { constraints?: Record<string, string> }).constraints ?? {}),
+        );
+        const langCtx = getRequestLanguageContext();
+        const translated = messages.map((message) =>
+          i18n.translate(message, {
+            acceptLanguageHeader: langCtx.acceptLanguageHeader,
+            userPreference: langCtx.userPreference,
+          }),
+        );
+        return new BadRequestException(
+          Array.isArray(translated) && translated.length > 0 ? translated : messages,
+        );
+      },
     }),
   );
 
-  // API prefix & versioning
-  const apiPrefix = configService.get('API_PREFIX', 'api');
-  const useVersioning = configService.get('API_VERSIONING_ENABLED', true);
-  if (useVersioning) {
-    app.setGlobalPrefix(`${apiPrefix}/v${DEFAULT_API_VERSION}`);
-    logger.log(`API versioning enabled: v${DEFAULT_API_VERSION}`);
-  } else {
-    app.setGlobalPrefix(apiPrefix);
+  // Register global interceptors
+  const responseFormatInterceptor = app.get(ResponseFormatInterceptor);
+  const versionHeaderInterceptor = app.get(VersionHeaderInterceptor);
+  const deprecationWarningInterceptor = app.get(DeprecationWarningInterceptor);
+  const cacheMetricsInterceptor = app.get(CacheMetricsInterceptor);
+  const rateLimitHeadersInterceptor = app.get(RateLimitHeadersInterceptor);
+
+  app.useGlobalInterceptors(
+    responseFormatInterceptor,
+    versionHeaderInterceptor,
+    deprecationWarningInterceptor,
+    cacheMetricsInterceptor,
+    rateLimitHeadersInterceptor,
+    new TraceInterceptor(),
+  );
+
+  // Issue #964 – Exception filters are registered globally via APP_FILTER
+  // providers in AppModule (see providers array). We avoid calling
+  // useGlobalFilters here to prevent double registration of the same
+  // filter classes.
+
+  // Register global guards
+  const reflector = app.get(Reflector);
+  const rateLimitService = app.get(RateLimitService);
+  app.useGlobalGuards(new RateLimitGuard(reflector, rateLimitService));
+
+  // Setup Swagger documentation and serve the same spec at /api/openapi.json
+  const openApiDocument = setupSwagger(app);
+  setupOpenAPIEndpoint(app, openApiDocument);
+
+  app.enableShutdownHooks();
+
+  const port = process.env.PORT || 3000;
+  await app.listen(port);
+  logger.log(`PropChain API running on http://localhost:${port}`);
+
+  // Issue #1249 – Dedicated Prometheus metrics listener on METRICS_PORT
+  const metricsPortEnv = process.env.METRICS_PORT;
+  if (metricsPortEnv) {
+    const metricsPort = parseInt(metricsPortEnv, 10);
+    if (!isNaN(metricsPort) && metricsPort !== Number(port)) {
+      const http = await import('http');
+      const { register } = await import('prom-client');
+      const metricsServer = http.createServer(async (req, res) => {
+        if (req.url === '/metrics' && req.method === 'GET') {
+          const expectedToken = process.env.METRICS_BEARER_TOKEN;
+          if (expectedToken) {
+            const auth = req.headers['authorization'];
+            const token = auth?.startsWith('Bearer ')
+              ? auth.substring(7)
+              : req.headers['x-metrics-token'];
+            if (token !== expectedToken) {
+              res.writeHead(401, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ statusCode: 401, message: 'Unauthorized' }));
+              return;
+            }
+          }
+          res.writeHead(200, { 'Content-Type': register.contentType });
+          res.end(await register.metrics());
+        } else {
+          res.writeHead(404);
+          res.end();
+        }
+      });
+      metricsServer.listen(metricsPort, () => {
+        logger.log(
+          `📊 Dedicated Prometheus metrics listener running on http://localhost:${metricsPort}/metrics`,
+        );
+      });
+    }
   }
 
-  // Swagger docs
-  if (configService.get('SWAGGER_ENABLED', true)) {
-    const config = new DocumentBuilder()
-      .setTitle('PropChain API')
-      .setDescription('Decentralized Real Estate Infrastructure - Backend API')
-      .setVersion(DEFAULT_API_VERSION)
-      .addTag('auth')
-      .addTag('users')
-      .addTag('properties')
-      .addTag('transactions')
-      .addTag('valuation')
-      .addTag('documents')
-      .addTag('blockchain')
-      .addTag('Audit & Compliance')
-      .addTag('search')
-      .addTag('security')
-      .addTag('health')
-      .addTag('backup-recovery')
-      .addTag('API Keys')
-      .addTag('feature-flags')
-      .addBearerAuth()
-      .addApiKey({ type: 'apiKey', name: 'X-API-KEY', in: 'header' }, 'apiKey')
-      .addApiKey({ type: 'apiKey', name: 'Accept-Version', in: 'header' }, 'version')
-      .build();
-
-    const document = SwaggerModule.createDocument(app, config, {
-      extraModels: [ErrorResponseDto],
-    });
-    SwaggerModule.setup(`${apiPrefix}/docs`, app, document, {
-      customSiteTitle: 'PropChain API Documentation',
-      customCss: '.swagger-ui .topbar { display: none }',
-      customfavIcon: '/favicon.ico',
-      swaggerOptions: {
-        persistAuthorization: true,
-        docExpansion: 'none',
-        filter: true,
-        showRequestDuration: true,
-      },
-    });
-    logger.log(`Swagger documentation available at /${apiPrefix}/docs`);
-  }
-
-  // Database connection with retry logic
-  const dataSource = app.get(DataSource);
-  await connectWithRetry(dataSource, 5, 2000);
-
-  // Start server
-  const port = configService.get<number>('PORT', 3000);
-  const host = configService.get<string>('HOST', '0.0.0.0');
-  await app.listen(port, host);
-
-  logger.log(`🚀 PropChain Backend is running on: http://${host}:${port}/${apiPrefix}`);
-  logger.log(`🏠 Environment: ${configService.get('NODE_ENV', 'development')}`);
-  logger.log(`📊 Health check: http://${host}:${port}/${apiPrefix}/health`);
-
-  // Graceful shutdown
-  process.on('SIGTERM', async () => {
-    logger.log('SIGTERM signal received: closing HTTP server');
-    await app.close();
-    process.exit(0);
-  });
-  process.on('SIGINT', async () => {
-    logger.log('SIGINT signal received: closing HTTP server');
-    await app.close();
-    process.exit(0);
-  });
+  logger.log(`API Versioning enabled. Supported versions: v1, v2`);
+  logger.log(`📚 Swagger UI available at http://localhost:${port}/api/docs`);
+  logger.log(`📋 OpenAPI spec available at http://localhost:${port}/api/openapi.json`);
+  logger.log(`💾 Redis Caching enabled`);
+  logger.log(`🛡️ Rate Limiting enabled (per-user, per-endpoint, IP-based)`);
+  logger.log(
+    `✅ Response format interceptor enabled - all API responses now follow standardized format`,
+  );
 }
 
-bootstrap().catch(async (error) => {
-  const tempLogger = new (await import('./common/logging/logger.service')).StructuredLoggerService(null);
-  tempLogger.setContext('Main');
-  tempLogger.error('Failed to start application:', error.stack, {});
-  process.exit(1);
-});
+bootstrap();

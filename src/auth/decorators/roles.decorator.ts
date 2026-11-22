@@ -1,4 +1,5 @@
 import { SetMetadata } from '@nestjs/common';
-import { RequiredRoles } from '../guards/rbac.guard';
+import { UserRole } from '../../types/prisma.types';
 
-export const Roles = (resource: string, action: string) => SetMetadata('roles', { resource, action });
+export const ROLES_KEY = 'roles';
+export const Roles = (...roles: UserRole[]) => SetMetadata(ROLES_KEY, roles);

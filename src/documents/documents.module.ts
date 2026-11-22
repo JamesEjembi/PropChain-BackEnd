@@ -1,48 +1,55 @@
-import { Module } from '@nestjs/common';
-import { ConfigModule } from '@nestjs/config';
-import storageConfig from '../config/storage.config';
-import { DocumentController } from './document.controller';
-import {
-  DocumentService,
-  InMemoryStorageProvider,
-  S3StorageProvider,
-  STORAGE_CONFIG,
-  STORAGE_PROVIDER,
-} from './document.service';
-import { FileStorageService } from './storage/file-storage.service';
-import { SecureFileValidator } from '../security/validators/secure-file.validator';
-import { FileValidationService } from '../security/services/file-validation.service';
-import { MalwareScannerService } from '../security/services/malware-scanner.service';
-import {
-  DocumentFilesUploadInterceptor,
-  DocumentFileUploadInterceptor,
-} from './interceptors/document-upload.interceptor';
+import { Module, Type } from '@nestjs/common';
+import { DocumentsService } from './documents.service';
+import { DocumentsController } from './documents.controller';
+import { DocumentUploadService } from './document-upload.service';
+import { PrismaModule } from '../database/prisma.module';
+import { AuthModule } from '../auth/auth.module';
+import { SignedUrlService } from './signed-url/signed-url.service';
+import { NotConfiguredSignedUrlProvider } from './signed-url/not-configured.signed-url-provider';
+import { S3SignedUrlProvider } from './signed-url/s3-signed-url-provider';
+import { GcsSignedUrlProvider } from './signed-url/gcs-signed-url-provider';
+import { AzureSignedUrlProvider } from './signed-url/azure-signed-url-provider';
+import { DocumentsDownloadController } from './documents-download.controller';
+import { SignedUrlProvider } from './signed-url/signed-url-provider.interface';
+
+export const SIGNED_URL_PROVIDER_TOKEN = 'SIGNED_URL_PROVIDER_TOKEN';
+
+/**
+ * Factory that selects the SignedUrlProvider implementation based on the
+ * SIGNED_URL_PROVIDER environment variable.
+ *
+ * Supported values:
+ *   - 's3'          -> S3SignedUrlProvider (no-op shell for integrators)
+ *   - 'gcs'         -> GcsSignedUrlProvider (no-op shell for integrators)
+ *   - 'azure'       -> AzureSignedUrlProvider (no-op shell for integrators)
+ *   - (unset/other) -> NotConfiguredSignedUrlProvider (throws a configured error)
+ */
+function signedUrlProviderFactory(): Type<SignedUrlProvider> {
+  const provider = process.env.SIGNED_URL_PROVIDER?.toLowerCase();
+  switch (provider) {
+    case 's3':
+      return S3SignedUrlProvider;
+    case 'gcs':
+      return GcsSignedUrlProvider;
+    case 'azure':
+      return AzureSignedUrlProvider;
+    default:
+      return NotConfiguredSignedUrlProvider;
+  }
+}
 
 @Module({
-  controllers: [DocumentController],
+  imports: [PrismaModule, AuthModule],
+  controllers: [DocumentsController, DocumentsDownloadController],
   providers: [
-    DocumentService,
-    FileStorageService,
-    SecureFileValidator,
-    FileValidationService,
-    MalwareScannerService,
-    DocumentFilesUploadInterceptor,
-    DocumentFileUploadInterceptor,
+    DocumentsService,
+    DocumentUploadService,
+    SignedUrlService,
     {
-      provide: STORAGE_CONFIG,
-      useFactory: storageConfig,
-    },
-    {
-      provide: STORAGE_PROVIDER,
-      useFactory: (config: ReturnType<typeof storageConfig>) => {
-        if (config.provider === 'memory') {
-          return new InMemoryStorageProvider(config);
-        }
-        return new S3StorageProvider(config);
-      },
-      inject: [STORAGE_CONFIG],
+      provide: SIGNED_URL_PROVIDER_TOKEN,
+      useClass: signedUrlProviderFactory(),
     },
   ],
-  imports: [ConfigModule],
+  exports: [DocumentsService, DocumentUploadService, SignedUrlService],
 })
 export class DocumentsModule {}

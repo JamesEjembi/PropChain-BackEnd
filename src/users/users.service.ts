@@ -1,0 +1,956 @@
+import {
+  Injectable,
+  OnModuleInit,
+  Optional,
+  NotFoundException,
+  BadRequestException,
+} from '@nestjs/common';
+import { AppLogger } from '../common/logger';
+import { UsersCacheService, USER_STATISTICS_TTL_SECONDS } from './users-cache.service';
+import {
+  USERS_DEFAULT_PAGE_SIZE,
+  UsersPaginationQueryDto,
+  buildUsersPageMeta,
+} from './dto/pagination-query.dto';
+import * as crypto from 'crypto';
+import * as fs from 'fs';
+import * as path from 'path';
+import { Prisma } from '@prisma/client';
+
+import { PrismaService } from '../database/prisma.service';
+import { redactEmail } from '../auth/security.utils';
+import {
+  hashPassword,
+  sanitizeUser,
+  createSha256,
+  generateReactivationToken,
+} from '../auth/security.utils';
+import { CreateUserDto, SearchUsersDto, UpdatePreferencesDto, UpdateUserDto } from './dto/user.dto';
+import { DeactivateAccountDto, ReactivateAccountDto } from './dto/deactivation.dto';
+import { UpdateProfileDto } from './dto/update-profile.dto';
+import { ProfileResponseDto } from './dto/profile-response.dto';
+import { SessionsService } from '../sessions/sessions.service';
+import { userRegistrationsTotal } from '../metrics/metrics.controller';
+
+@Injectable()
+export class UsersService implements OnModuleInit {
+  private readonly logger = new AppLogger(UsersService.name);
+
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly sessionsService: SessionsService,
+    @Optional() private readonly usersCache?: UsersCacheService,
+  ) {}
+
+  async getProfile(userId: string): Promise<ProfileResponseDto> {
+    const user = await this.prisma.user.findUnique({
+      where: {
+        id: userId,
+        isDeactivated: false,
+      },
+      include: {
+        properties: {
+          select: { id: true },
+        },
+        buyerTransactions: {
+          select: { id: true },
+        },
+        sellerTransactions: {
+          select: { id: true },
+        },
+        _count: {
+          select: {
+            properties: true,
+            buyerTransactions: true,
+            sellerTransactions: true,
+          },
+        },
+      },
+    });
+
+    if (!user) {
+      throw new NotFoundException('User profile not found');
+    }
+
+    const now = new Date();
+    const createdAt = new Date(user.createdAt);
+    const accountAgeDays = Math.floor(
+      (now.getTime() - createdAt.getTime()) / (1000 * 60 * 60 * 24),
+    );
+
+    return {
+      id: user.id,
+      email: user.email,
+      firstName: user.firstName,
+      lastName: user.lastName,
+      fullName: `${user.firstName} ${user.lastName}`,
+      phone: user.phone,
+      avatar: user.avatar,
+      bio: null,
+      role: user.role,
+      isVerified: user.isVerified,
+      preferredChannel: user.preferredChannel,
+      languagePreference: user.languagePreference,
+      timezone: user.timezone,
+      contactHours: user.contactHours as {
+        start: string;
+        end: string;
+      } | null,
+      address: null,
+      occupation: null,
+      company: null,
+      referralCode: user.referralCode,
+      createdAt: user.createdAt,
+      updatedAt: user.updatedAt,
+      lastActivityAt: user.lastActivityAt,
+      statistics: {
+        propertiesCount: user._count.properties,
+        transactionsCount: user._count.buyerTransactions + user._count.sellerTransactions,
+        accountAgeDays,
+      },
+    };
+  }
+
+  async updateProfile(userId: string, data: UpdateProfileDto): Promise<ProfileResponseDto> {
+    if (data.email) {
+      const existingUser = await this.prisma.user.findFirst({
+        where: {
+          email: data.email,
+          NOT: { id: userId },
+        },
+      });
+
+      if (existingUser) {
+        throw new BadRequestException('Email address is already in use');
+      }
+    }
+
+    const updateData: Prisma.UserUpdateInput = {};
+
+    if (data.firstName !== undefined) {
+      updateData.firstName = data.firstName;
+    }
+
+    if (data.lastName !== undefined) {
+      updateData.lastName = data.lastName;
+    }
+
+    if (data.email !== undefined) {
+      updateData.email = data.email;
+    }
+
+    if (data.phone !== undefined) {
+      updateData.phone = data.phone;
+    }
+
+    if (data.avatar !== undefined) {
+      updateData.avatar = data.avatar;
+    }
+
+    if (data.preferredChannel !== undefined) {
+      updateData.preferredChannel = data.preferredChannel;
+    }
+
+    if (data.languagePreference !== undefined) {
+      updateData.languagePreference = data.languagePreference;
+    }
+
+    if (data.timezone !== undefined) {
+      updateData.timezone = data.timezone;
+    }
+
+    if (data.contactHours !== undefined) {
+      updateData.contactHours = data.contactHours as unknown as Prisma.InputJsonValue;
+    }
+
+    await this.prisma.user.update({
+      where: { id: userId },
+      data: updateData,
+    });
+
+    await this.prisma.activityLog.create({
+      data: {
+        userId,
+        action: 'UPDATE_PROFILE',
+        entityType: 'USER',
+        entityId: userId,
+        description: 'User updated their profile',
+        metadata: {
+          updatedFields: Object.keys(updateData),
+        },
+      },
+    });
+
+    return this.getProfile(userId);
+  }
+
+  onModuleInit(): void {
+    setInterval(
+      () => {
+        void this.cleanupExports();
+      },
+      60 * 60 * 1000,
+    );
+
+    void this.cleanupExports();
+  }
+
+  private async cleanupExports(): Promise<void> {
+    const exportsDir = path.join(process.cwd(), 'exports');
+
+    if (!fs.existsSync(exportsDir)) {
+      return;
+    }
+
+    const files = fs.readdirSync(exportsDir);
+    const now = Date.now();
+    const expirationTime = 24 * 60 * 60 * 1000;
+
+    files.forEach((file) => {
+      const filepath = path.join(exportsDir, file);
+      const stats = fs.statSync(filepath);
+
+      if (now - stats.mtimeMs > expirationTime) {
+        fs.unlinkSync(filepath);
+        this.logger.log('Deleted expired export file', {
+          event: 'users.export_file_deleted',
+          file,
+        });
+      }
+    });
+  }
+
+  /** Cached for 60 seconds per user; statistics may be that stale. Cache failures fall back to the database. */
+  async getUserStatistics(userId: string) {
+    if (!this.usersCache) return this.loadUserStatistics(userId);
+    return this.usersCache.remember(
+      this.usersCache.statisticsKey(userId),
+      USER_STATISTICS_TTL_SECONDS,
+      () => this.loadUserStatistics(userId),
+    );
+  }
+
+  private async loadUserStatistics(userId: string) {
+    // Count in the database instead of loading every property and transaction row.
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: {
+        createdAt: true,
+        lastActivityAt: true,
+        _count: { select: { properties: true, buyerTransactions: true, sellerTransactions: true } },
+      },
+    });
+
+    if (!user) {
+      throw new NotFoundException('User not found');
+    }
+
+    const propertiesCount = user._count.properties;
+    const transactionsCount = user._count.buyerTransactions + user._count.sellerTransactions;
+
+    const now = new Date();
+    const createdAt = new Date(user.createdAt);
+    const accountAgeDays = Math.floor(
+      (now.getTime() - createdAt.getTime()) / (1000 * 60 * 60 * 24),
+    );
+
+    return {
+      propertiesCount,
+      transactionsCount,
+      accountAgeDays,
+      lastActivityAt: user.lastActivityAt,
+    };
+  }
+
+  async create(data: CreateUserDto) {
+    const passwordHash = await hashPassword(data.password);
+
+    let referralCode: string;
+
+    do {
+      referralCode = Math.random().toString(36).substring(2, 8).toUpperCase();
+    } while (
+      await this.prisma.user.findUnique({
+        where: { referralCode },
+      })
+    );
+
+    let referredById: string | null = null;
+
+    if (data.referralCode) {
+      const referrer = await this.prisma.user.findUnique({
+        where: { referralCode: data.referralCode },
+      });
+
+      if (referrer) {
+        referredById = referrer.id;
+      }
+    }
+
+    const user = await this.prisma.user.create({
+      data: {
+        email: data.email,
+        password: passwordHash,
+        firstName: data.firstName,
+        lastName: data.lastName,
+        phone: data.phone,
+        preferredChannel: data.preferredChannel,
+        languagePreference: data.languagePreference,
+        timezone: data.timezone,
+        contactHours: data.contactHours,
+        referralCode,
+        referredById,
+        passwordHistory: {
+          create: {
+            passwordHash,
+          },
+        },
+        preferences: {
+          create: {
+            emailNotifications: true,
+            smsNotifications: false,
+            inAppNotifications: true,
+            pushNotifications: false,
+          },
+        },
+      },
+    });
+
+    userRegistrationsTotal.inc({ method: 'email' });
+    this.logger.log('User created', {
+      event: 'users.created',
+      userId: user.id,
+      emailHash: redactEmail(user.email),
+    });
+
+    return sanitizeUser(user);
+  }
+
+  /**
+   * Lists active users. Without `page`/`limit` the full array is returned as
+   * before; with either, the result is `{ data, meta }`, newest first, with
+   * `limit` capped at 100 and `id` as a tie-breaker so pages are stable.
+   */
+  async findAll(query: UsersPaginationQueryDto = {}) {
+    const where = { isDeactivated: false };
+    const select = {
+      id: true,
+      email: true,
+      firstName: true,
+      lastName: true,
+      role: true,
+      isVerified: true,
+      createdAt: true,
+    };
+    if (query.page === undefined && query.limit === undefined) {
+      return this.prisma.user.findMany({ where, select });
+    }
+
+    const page = query.page ?? 1;
+    const limit = query.limit ?? USERS_DEFAULT_PAGE_SIZE;
+    const [data, total] = await Promise.all([
+      this.prisma.user.findMany({
+        where,
+        select,
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+        skip: (page - 1) * limit,
+        take: limit,
+      }),
+      this.prisma.user.count({ where }),
+    ]);
+    return { data, meta: buildUsersPageMeta(page, limit, total) };
+  }
+
+  async findOne(id: string) {
+    return this.prisma.user.findFirst({
+      where: {
+        id,
+        isDeactivated: false,
+      },
+      select: {
+        id: true,
+        email: true,
+        firstName: true,
+        lastName: true,
+        phone: true,
+        role: true,
+        isVerified: true,
+        avatar: true,
+        preferredChannel: true,
+        languagePreference: true,
+        timezone: true,
+        contactHours: true,
+        createdAt: true,
+        updatedAt: true,
+      },
+    });
+  }
+
+  async findByEmail(email: string) {
+    return this.prisma.user.findUnique({
+      where: { email },
+    });
+  }
+
+  async update(id: string, data: UpdateUserDto) {
+    return this.prisma.user.update({
+      where: { id },
+      data,
+      select: {
+        id: true,
+        email: true,
+        firstName: true,
+        lastName: true,
+        phone: true,
+        role: true,
+        isVerified: true,
+        avatar: true,
+        preferredChannel: true,
+        languagePreference: true,
+        timezone: true,
+        contactHours: true,
+        updatedAt: true,
+      },
+    });
+  }
+
+  async updatePreferences(id: string, data: UpdatePreferencesDto) {
+    return this.prisma.user.update({
+      where: { id },
+      data,
+      select: {
+        id: true,
+        preferredChannel: true,
+        languagePreference: true,
+        timezone: true,
+        contactHours: true,
+        updatedAt: true,
+      },
+    });
+  }
+
+  async updateAvatar(id: string, avatarUrl: string | null) {
+    return this.prisma.user.update({
+      where: { id },
+      data: { avatar: avatarUrl },
+      select: {
+        id: true,
+        email: true,
+        firstName: true,
+        lastName: true,
+        phone: true,
+        role: true,
+        isVerified: true,
+        avatar: true,
+        updatedAt: true,
+      },
+    });
+  }
+
+  async block(id: string) {
+    const blocked = await this.prisma.user.update({
+      where: { id },
+      data: { isBlocked: true },
+      select: {
+        id: true,
+        email: true,
+        isBlocked: true,
+      },
+    });
+    this.logger.warn('User blocked', { event: 'users.blocked', userId: id });
+    return blocked;
+  }
+
+  async unblock(id: string) {
+    const unblocked = await this.prisma.user.update({
+      where: { id },
+      data: { isBlocked: false },
+      select: {
+        id: true,
+        email: true,
+        isBlocked: true,
+      },
+    });
+    this.logger.log('User unblocked', { event: 'users.unblocked', userId: id });
+    return unblocked;
+  }
+
+  async remove(id: string) {
+    const removed = await this.prisma.user.delete({
+      where: { id },
+    });
+    this.logger.warn('User deleted', { event: 'users.deleted', userId: id });
+    return removed;
+  }
+
+  async exportPersonalData(id: string) {
+    const user = await this.prisma.user.findUnique({
+      where: { id },
+      include: {
+        properties: true,
+        buyerTransactions: {
+          include: {
+            property: true,
+            seller: {
+              select: {
+                id: true,
+                firstName: true,
+                lastName: true,
+                email: true,
+              },
+            },
+          },
+        },
+        sellerTransactions: {
+          include: {
+            property: true,
+            buyer: {
+              select: {
+                id: true,
+                firstName: true,
+                lastName: true,
+                email: true,
+              },
+            },
+          },
+        },
+        documents: true,
+        apiKeys: {
+          select: {
+            id: true,
+            name: true,
+            keyPrefix: true,
+            lastUsedAt: true,
+            createdAt: true,
+          },
+        },
+      },
+    });
+
+    if (!user) {
+      throw new NotFoundException('User not found');
+    }
+
+    const safeUser = {
+      ...user,
+      password: undefined,
+      twoFactorSecret: undefined,
+      twoFactorBackupCodes: undefined,
+    };
+
+    return {
+      metadata: {
+        exportDate: new Date().toISOString(),
+        version: '1.0',
+        type: 'PERSONAL_DATA_EXPORT',
+      },
+      data: safeUser,
+    };
+  }
+
+  async deactivate(userId: string, data: DeactivateAccountDto) {
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId },
+    });
+
+    if (!user) {
+      throw new NotFoundException('User not found');
+    }
+
+    if (user.isDeactivated) {
+      throw new BadRequestException('Account is already deactivated');
+    }
+
+    const scheduledDeletionAt = data.scheduleDeletion
+      ? new Date(Date.now() + 30 * 24 * 60 * 60 * 1000)
+      : null;
+
+    const updatedUser = await this.prisma.user.update({
+      where: { id: userId },
+      data: {
+        isDeactivated: true,
+        deactivatedAt: new Date(),
+        scheduledDeletionAt,
+      },
+      select: {
+        id: true,
+        email: true,
+        firstName: true,
+        lastName: true,
+        isDeactivated: true,
+        deactivatedAt: true,
+        scheduledDeletionAt: true,
+      },
+    });
+
+    this.logger.log('User deactivated', {
+      event: 'users.deactivated',
+      userId,
+      emailHash: redactEmail(user.email),
+      scheduledDeletionAt: scheduledDeletionAt ? scheduledDeletionAt.toISOString() : null,
+    });
+
+    await this.sessionsService.revokeAllSessions(userId);
+
+    return updatedUser;
+  }
+
+  async requestReactivation(userId: string): Promise<{ message: string }> {
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId },
+    });
+
+    if (!user) {
+      throw new NotFoundException('User not found');
+    }
+
+    if (!user.isDeactivated) {
+      throw new BadRequestException('Account is not deactivated');
+    }
+
+    const { hash } = generateReactivationToken();
+    const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000);
+
+    await this.prisma.user.update({
+      where: { id: userId },
+      data: {
+        reactivationToken: hash,
+        reactivationTokenExpires: expiresAt,
+      },
+    });
+
+    this.logger.log('Reactivation token generated', {
+      event: 'users.reactivation_token_generated',
+      userId,
+      emailHash: redactEmail(user.email),
+    });
+
+    return {
+      message: 'Reactivation token generated. Use the token to reactivate your account.',
+    };
+  }
+
+  async reactivate(userId: string, data: ReactivateAccountDto) {
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId },
+    });
+
+    if (!user) {
+      throw new NotFoundException('User not found');
+    }
+
+    if (!user.isDeactivated) {
+      throw new BadRequestException('Account is not deactivated');
+    }
+
+    if (!user.reactivationToken || !user.reactivationTokenExpires) {
+      throw new BadRequestException(
+        'No reactivation token has been requested. Please request a token first.',
+      );
+    }
+
+    if (new Date() > user.reactivationTokenExpires) {
+      await this.prisma.user.update({
+        where: { id: userId },
+        data: {
+          reactivationToken: null,
+          reactivationTokenExpires: null,
+        },
+      });
+
+      throw new BadRequestException('Reactivation token has expired. Please request a new one.');
+    }
+
+    const providedHash = createSha256(data.token);
+    const storedHash = user.reactivationToken;
+    const storedHashBuffer = Buffer.from(storedHash);
+    const providedHashBuffer = Buffer.from(providedHash);
+
+    if (
+      storedHashBuffer.length !== providedHashBuffer.length ||
+      !crypto.timingSafeEqual(storedHashBuffer, providedHashBuffer)
+    ) {
+      throw new BadRequestException('Invalid reactivation token');
+    }
+
+    const updatedUser = await this.prisma.user.update({
+      where: { id: userId },
+      data: {
+        isDeactivated: false,
+        deactivatedAt: null,
+        scheduledDeletionAt: null,
+        reactivationToken: null,
+        reactivationTokenExpires: null,
+      },
+      select: {
+        id: true,
+        email: true,
+        firstName: true,
+        lastName: true,
+        isDeactivated: true,
+        deactivatedAt: true,
+        scheduledDeletionAt: true,
+      },
+    });
+
+    await this.prisma.activityLog.create({
+      data: {
+        userId,
+        action: 'REACTIVATE',
+        entityType: 'USER',
+        entityId: userId,
+        description: 'Account reactivated',
+      },
+    });
+
+    this.logger.log('User reactivated', {
+      event: 'users.reactivated',
+      userId,
+      emailHash: redactEmail(user.email),
+    });
+
+    return updatedUser;
+  }
+
+  async findActiveUsers() {
+    return this.prisma.user.findMany({
+      where: {
+        isDeactivated: false,
+      },
+      select: {
+        id: true,
+        email: true,
+        firstName: true,
+        lastName: true,
+        role: true,
+        isVerified: true,
+        avatar: true,
+        createdAt: true,
+      },
+    });
+  }
+
+  /**
+   * Builds the Prisma filter for the admin user search: active users only, with
+   * a free-text match over email and names (`q`), a partial email match, and a
+   * name match ("First Last" matches both parts, a single word matches either).
+   */
+  private buildSearchWhere(filters: {
+    q?: string;
+    email?: string;
+    name?: string;
+  }): Prisma.UserWhereInput {
+    const { q, email, name } = filters;
+    const contains = (value: string) => ({ contains: value, mode: 'insensitive' as const });
+    const where: Prisma.UserWhereInput = { isDeactivated: false };
+
+    if (q) {
+      where.OR = [{ email: contains(q) }, { firstName: contains(q) }, { lastName: contains(q) }];
+    }
+
+    if (email) {
+      where.email = contains(email);
+    }
+
+    if (name) {
+      const nameParts = name.split(' ');
+      if (nameParts.length > 1) {
+        where.AND = [
+          { firstName: contains(nameParts[0]) },
+          { lastName: contains(nameParts[nameParts.length - 1]) },
+        ];
+      } else {
+        // As before, a single-word name replaces any `q` match.
+        where.OR = [{ firstName: contains(name) }, { lastName: contains(name) }];
+      }
+    }
+
+    return where;
+  }
+
+  async search(filters: SearchUsersDto) {
+    const { q, email, name, page = 1, limit = 10 } = filters;
+    const skip = (page - 1) * limit;
+
+    const where = this.buildSearchWhere({ q, email, name });
+
+    const [users, total] = await Promise.all([
+      this.prisma.user.findMany({
+        where,
+        skip,
+        take: limit,
+        select: {
+          id: true,
+          email: true,
+          firstName: true,
+          lastName: true,
+          role: true,
+          isVerified: true,
+          avatar: true,
+          createdAt: true,
+        },
+        orderBy: {
+          createdAt: 'desc',
+        },
+      }),
+      this.prisma.user.count({ where }),
+    ]);
+
+    return {
+      data: users,
+      meta: {
+        total,
+        page,
+        limit,
+        totalPages: Math.ceil(total / limit),
+      },
+    };
+  }
+
+  async findScheduledForDeletion() {
+    return this.prisma.user.findMany({
+      where: {
+        isDeactivated: true,
+        scheduledDeletionAt: {
+          not: null,
+        },
+      },
+      select: {
+        id: true,
+        email: true,
+        firstName: true,
+        lastName: true,
+        deactivatedAt: true,
+        scheduledDeletionAt: true,
+      },
+    });
+  }
+
+  async deleteDeactivatedUsers() {
+    const now = new Date();
+
+    const usersToDelete = await this.prisma.user.findMany({
+      where: {
+        isDeactivated: true,
+        scheduledDeletionAt: {
+          lte: now,
+        },
+      },
+      select: {
+        id: true,
+        email: true,
+      },
+    });
+
+    if (usersToDelete.length === 0) {
+      return { deletedCount: 0 };
+    }
+
+    const userIds = usersToDelete.map((user) => user.id);
+    const userEmails = usersToDelete.map((user) => user.email);
+
+    const result = await this.prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+      await tx.loginAttempt.deleteMany({
+        where: {
+          email: {
+            in: userEmails,
+          },
+        },
+      });
+
+      return tx.user.deleteMany({
+        where: {
+          id: {
+            in: userIds,
+          },
+        },
+      });
+    });
+
+    this.logger.log('Deleted deactivated users', {
+      event: 'users.deactivated_purged',
+      deletedCount: result.count,
+    });
+
+    return { deletedCount: result.count };
+  }
+
+  async getReferralStats(userId: string) {
+    const referralCount = await this.prisma.user.count({
+      where: {
+        referredById: userId,
+      },
+    });
+
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: {
+        referralCode: true,
+      },
+    });
+
+    return {
+      referralCode: user?.referralCode,
+      referralCount,
+    };
+  }
+
+  async getMyReferrals(userId: string) {
+    return this.prisma.user.findMany({
+      where: {
+        referredById: userId,
+      },
+      select: {
+        id: true,
+        firstName: true,
+        lastName: true,
+        email: true,
+        createdAt: true,
+      },
+    });
+  }
+
+  async getLoginHistory(userId: string) {
+    return this.prisma.loginHistory.findMany({
+      where: {
+        userId,
+      },
+      orderBy: {
+        timestamp: 'desc',
+      },
+      // Newest 100 entries: the history grows without bound, and one response should not.
+      take: 100,
+      select: {
+        timestamp: true,
+        ipAddress: true,
+        userAgent: true,
+      },
+    });
+  }
+
+  async verify(id: string) {
+    return this.prisma.user.update({
+      where: { id },
+      data: {
+        isVerified: true,
+      },
+      select: {
+        id: true,
+        isVerified: true,
+      },
+    });
+  }
+
+  async unverify(id: string) {
+    return this.prisma.user.update({
+      where: { id },
+      data: {
+        isVerified: false,
+      },
+      select: {
+        id: true,
+        isVerified: true,
+      },
+    });
+  }
+}

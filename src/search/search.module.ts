@@ -1,14 +1,35 @@
 import { Module } from '@nestjs/common';
-import { TypeOrmModule } from '@nestjs/typeorm';
-import { SearchController } from './search.controller';
 import { SearchService } from './search.service';
-import { SearchCache } from './entities/search-cache.entity';
-import { SearchAnalytics } from './entities/search-analytics.entity';
+import { SearchController } from './search.controller';
+import { SearchAnalyticsService } from './search-analytics.service';
+import { SearchAutocompleteService } from './search-autocomplete.service';
+import { SearchFiltersService } from './search-filters.service';
+import { SearchGeographicService } from './search-geographic.service';
+import { SearchHistoryService } from './search-history.service';
+import { SearchFacetsService } from './search-facets.service';
+import { PrismaModule } from '../database/prisma.module';
+import { CacheModuleConfig } from '../cache/cache.module';
 
 @Module({
-  imports: [TypeOrmModule.forFeature([SearchCache, SearchAnalytics])],
+  imports: [PrismaModule, CacheModuleConfig],
   controllers: [SearchController],
-  providers: [SearchService],
-  exports: [SearchService],
+  providers: [
+    SearchService,
+    SearchAnalyticsService,
+    SearchAutocompleteService,
+    SearchFiltersService,
+    SearchGeographicService,
+    SearchHistoryService,
+    SearchFacetsService,
+  ],
+  exports: [
+    SearchService,
+    SearchAnalyticsService,
+    SearchAutocompleteService,
+    SearchFiltersService,
+    SearchGeographicService,
+    SearchHistoryService,
+    SearchFacetsService,
+  ],
 })
 export class SearchModule {}

@@ -1,0 +1,112 @@
+{
+  "common": {
+    "validation_failed": "Validation failed",
+    "unexpected_error": "An unexpected error occurred",
+    "internal_server_error": "Internal server error",
+    "bad_request": "Bad request",
+    "unauthorized": "Unauthorized",
+    "forbidden": "Forbidden",
+    "not_found": "Resource not found",
+    "conflict": "Resource conflict",
+    "rate_limited": "Too many requests. Please try again later.",
+    "service_unavailable": "Service unavailable. Please try again later."
+  },
+  "validation": {
+    "required": "{field} is required",
+    "email_invalid": "{field} must be a valid email address",
+    "min_length": "{field} must be at least {min} characters",
+    "max_length": "{field} must be at most {max} characters",
+    "must_be_string": "{field} must be a string",
+    "must_be_number": "{field} must be a number",
+    "must_be_int": "{field} must be an integer",
+    "must_be_boolean": "{field} must be a boolean",
+    "must_be_uuid": "{field} must be a UUID",
+    "must_be_enum": "{field} must be one of: {options}",
+    "must_be_date": "{field} must be a valid date",
+    "is_in": "{field} must be one of: {options}",
+    "is_not_in": "{field} must not be one of: {options}",
+    "matches": "{field} format is invalid"
+  },
+  "auth": {
+    "invalid_credentials": "Invalid email or password",
+    "account_locked": "Your account is temporarily locked. Please try again later.",
+    "account_blocked": "Your account has been blocked. Please contact support.",
+    "email_not_verified": "Please verify your email address before continuing.",
+    "two_factor_required": "Two-factor authentication code required"
+  },
+  "users": {
+    "not_found": "User not found",
+    "email_taken": "Email is already in use",
+    "self_deletion_blocked_by_legal_hold": "Your account is on legal hold and cannot be deleted at this time.",
+    "self_deletion_already_requested": "An account deletion is already scheduled.",
+    "self_deletion_not_requested": "No active deletion request to cancel.",
+    "self_deletion_already_permanent": "Account has already been permanently deleted.",
+    "self_deletion_retention_too_short": "Retention period cannot be shorter than {min} days.",
+    "self_deletion_retention_too_long": "Retention period cannot exceed {max} days."
+  },
+  "properties": {
+    "not_found": "Property not found",
+    "duplicate": "Duplicate property listing detected"
+  },
+  "transactions": {
+    "not_found": "Transaction not found",
+    "invalid_state": "Transaction cannot transition from {from} to {to}"
+  },
+  "documents": {
+    "not_found": "Document not found",
+    "expired": "This document has expired."
+  },
+  "fraud": {
+    "alert_created_subject": "Security alert: {title}"
+  },
+  "http": {
+    "400": "The request was malformed or invalid.",
+    "401": "Authentication required.",
+    "403": "You do not have permission to perform this action.",
+    "404": "The requested resource was not found.",
+    "409": "The request conflicts with the current state of the resource.",
+    "422": "The submitted data failed validation.",
+    "429": "Too many requests. Please slow down.",
+    "500": "Internal server error.",
+    "503": "Service temporarily unavailable."
+  },
+  "prisma": {
+    "P2002": "A record with that value already exists.",
+    "P2003": "This action references a record that does not exist.",
+    "P2011": "A required field was missing.",
+    "P2014": "This action violates an existing relation.",
+    "P2025": "The record could not be found.",
+    "P2000": "One of the supplied values is too long."
+  },
+  "email": {
+    "password_reset_subject": "Password Reset - PropChain",
+    "password_reset_title": "Password Reset Request",
+    "password_reset_body": "You have requested to reset your password for your PropChain account.",
+    "password_reset_cta": "Reset Password",
+    "password_reset_ignore": "If you didn't request this password reset, please ignore this email.",
+    "password_reset_expiry": "This link will expire in 1 hour for security reasons.",
+    "account_locked_subject": "Account Locked - PropChain",
+    "account_locked_title": "Account Locked",
+    "account_locked_body": "Your PropChain account has been temporarily locked due to multiple failed login attempts.",
+    "account_locked_duration": "The lockout will automatically expire in {lockoutDuration} minutes.",
+    "account_locked_advice": "If you did not attempt to log in, please reset your password immediately or contact our support team.",
+    "fraud_alert_subject": "[Fraud Alert][{severity}] {title}",
+    "fraud_alert_title": "Fraud Alert Triggered",
+    "fraud_alert_summary": "Summary",
+    "transaction_status_subject": "[PropChain] Transaction {status}",
+    "transaction_pending_title": "Transaction Pending",
+    "transaction_pending_body": "Your transaction is pending. We will notify you of any updates.",
+    "transaction_completed_title": "Transaction Completed",
+    "transaction_completed_body": "Your transaction has been completed successfully.",
+    "transaction_cancelled_title": "Transaction Cancelled",
+    "transaction_cancelled_body": "Your transaction has been cancelled.",
+    "data_export_ready_subject": "Your PropChain data export is ready",
+    "data_export_ready_greeting": "Hi {name},",
+    "data_export_ready_body": "Your personal data export is ready. Use the link below to download your archive. Job ID: {jobId}",
+    "data_export_ready_security": "For your security, this download is single-use and expires shortly.",
+    "data_export_failed_subject": "Your PropChain data export failed",
+    "data_export_failed_body": "We could not complete your data export (Job ID: {jobId}). Please try again or contact support.",
+    "regards": "Best regards,",
+    "team": "The PropChain Team"
+  }
+}
